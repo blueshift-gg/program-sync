@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+
+# JSON data files (large)
+programs.json
+executable-accounts.json
+
+# CSV exports
+*.csv
+
+# Dumped programs
+programs/
+
+# Environment
+.env
+
+# OS files
+.DS_Store

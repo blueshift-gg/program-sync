@@ -1,0 +1,24 @@
+[package]
+name = "program-sync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+solana-program = "2.1"
+solana-client = "2.1"
+solana-sdk = "2.1"
+solana-account-decoder = "2.1"
+bs58 = "0.5"
+anyhow = "1.0"
+base64 = "0.22"
+dotenv = "0.15"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+tokio = { version = "1", features = ["full"] }
+rayon = "1.10"
+indicatif = "0.17"
+either = "1.13"
+sbpf-common = { path = "../../sbpf/crates/common" }
+sbpf-disassembler = { path = "../../sbpf/crates/disassembler" }
