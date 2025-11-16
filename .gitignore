@@ -7,13 +7,6 @@ Cargo.lock
 *.db-shm
 *.db-wal
 
-# JSON data files (large)
-programs.json
-executable-accounts.json
-
-# CSV exports
-*.csv
-
 # Dumped programs
 programs/
 
