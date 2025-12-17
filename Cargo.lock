@@ -2256,6 +2256,7 @@ dependencies = [
  "solana-client",
  "solana-commitment-config",
  "solana-program",
+ "solana-sbpf",
  "tokio",
 ]
 
@@ -4093,9 +4094,12 @@ dependencies = [
  "byteorder",
  "combine 3.8.1",
  "hash32",
+ "libc",
  "log",
+ "rand 0.8.5",
  "rustc-demangle",
  "thiserror 2.0.17",
+ "winapi",
 ]
 
 [[package]]

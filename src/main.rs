@@ -6,6 +6,12 @@ use rusqlite::{params, Connection};
 use sbpf_common::opcode::Opcode;
 use sbpf_disassembler::program::Program;
 use solana_client::rpc_client::RpcClient;
+use solana_sbpf::{
+    elf::Executable,
+    program::BuiltinProgram,
+    static_analysis::{Analysis, DataResource, DfgEdgeKind, DfgNode},
+    vm::{Config, ContextObject},
+};
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_program::pubkey::Pubkey;
@@ -36,6 +42,15 @@ struct ProgramAccount {
     loader_version: i32,
     derived_executable_pubkey: Option<Pubkey>,
     last_updated_slot: Option<u64>,
+}
+
+/// Dummy context object for static analysis (no execution needed)
+struct DummyContextObject;
+impl ContextObject for DummyContextObject {
+    fn consume(&mut self, _amount: u64) {}
+    fn get_remaining(&self) -> u64 {
+        0
+    }
 }
 
 /// Map loader version number to pubkey string
@@ -1125,6 +1140,160 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     Ok(())
 }
 
+fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_only: bool) -> Result<()> {
+    let register = uninit_reg.ok_or_else(|| anyhow::anyhow!("--uninit-reg <N> is required"))?;
+
+    println!("\nDFG Analysis");
+    println!("{}", "=".repeat(60));
+    if entry_only {
+        println!("Mode: entry-only (filtering for reads from program entrypoint)");
+    }
+
+    if !Path::new(&program_dir).exists() {
+        anyhow::bail!("Directory '{}' not found. Run sync first.", program_dir);
+    }
+
+    let entries = fs::read_dir(&program_dir)?;
+    let so_files: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "so").unwrap_or(false))
+        .collect();
+
+    println!("Found {} .so files to analyze", so_files.len());
+    println!("Checking for uninitialized reads of r{}", register);
+    println!();
+
+    let pb = ProgressBar::new(so_files.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  [{bar:40.green/black}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    // Store (pubkey, vec of (pc, disasm_text), entrypoint)
+    let programs_with_issues: Mutex<Vec<(String, Vec<(usize, String)>, usize)>> = Mutex::new(Vec::new());
+    let files_processed = AtomicUsize::new(0);
+    let files_with_errors = AtomicUsize::new(0);
+
+    so_files.par_iter().for_each(|entry| {
+        let path = entry.path();
+
+        let elf_data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(_) => {
+                files_with_errors.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            }
+        };
+
+        let loader = Arc::new(BuiltinProgram::<DummyContextObject>::new_loader(Config::default()));
+        let executable = match Executable::<DummyContextObject>::load(&elf_data, loader) {
+            Ok(e) => e,
+            Err(_) => {
+                files_with_errors.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            }
+        };
+
+        let analysis = match Analysis::from_executable(&executable) {
+            Ok(a) => a,
+            Err(_) => {
+                files_with_errors.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+                return;
+            }
+        };
+
+        // Find uninitialized reads: PhiNode-sourced Filled edges on target register.
+        let resource = DataResource::Register(register);
+        let mut uninit_locs: Vec<(usize, String)> = Vec::new();
+        let entrypoint = analysis.entrypoint;
+
+        for (node, edges) in &analysis.dfg_forward_edges {
+            if let DfgNode::PhiNode(phi_pc) = node {
+                // If --entry-only, skip PhiNodes that aren't at the entrypoint.
+                if entry_only && *phi_pc != entrypoint {
+                    continue;
+                }
+
+                for edge in edges {
+                    if edge.resource == resource && edge.kind == DfgEdgeKind::Filled {
+                        if let DfgNode::InstructionNode(pc) = edge.destination {
+                            let insn = analysis.instructions.iter().find(|i| i.ptr == pc);
+
+                            // Skip EXIT instructions.
+                            if let Some(i) = insn {
+                                if i.opc == 0x95 {
+                                    continue;
+                                }
+                            }
+
+                            let disasm_text = if disasm {
+                                if let Some(i) = insn {
+                                    analysis.disassemble_instruction(i, pc)
+                                } else {
+                                    format!("<pc {} not found>", pc)
+                                }
+                            } else {
+                                String::new()
+                            };
+                            uninit_locs.push((pc, disasm_text));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !uninit_locs.is_empty() {
+            let pubkey = path.file_stem().unwrap().to_string_lossy().to_string();
+            programs_with_issues.lock().unwrap().push((pubkey, uninit_locs, entrypoint));
+        }
+
+        files_processed.fetch_add(1, Ordering::Relaxed);
+        pb.inc(1);
+    });
+
+    pb.finish_and_clear();
+
+    let issues = programs_with_issues.into_inner().unwrap();
+    let files_processed = files_processed.load(Ordering::Relaxed);
+    let files_with_errors = files_with_errors.load(Ordering::Relaxed);
+
+    println!("\n{}", "=".repeat(60));
+    println!("RESULTS");
+    println!("{}", "=".repeat(60));
+    println!("Files processed:       {}", files_processed);
+    println!("Files with errors:     {}", files_with_errors);
+    println!();
+
+    if issues.is_empty() {
+        println!("No programs with uninitialized reads of r{} found", register);
+    } else {
+        println!(
+            "Found {} programs with uninitialized reads of r{}:",
+            issues.len(),
+            register
+        );
+        for (pubkey, locs, entrypoint) in &issues {
+            if disasm {
+                println!("\n  {} ({} locations, entrypoint=pc {}):", pubkey, locs.len(), entrypoint);
+                for (pc, disasm_text) in locs {
+                    println!("    pc {:>5}: {}", pc, disasm_text);
+                }
+            } else {
+                let pcs: Vec<usize> = locs.iter().map(|(pc, _)| *pc).collect();
+                println!("  {} (entry={}): {} location(s) at pc {:?}", pubkey, entrypoint, locs.len(), pcs);
+            }
+        }
+    }
+
+    println!("{}", "=".repeat(60));
+    Ok(())
+}
+
 fn print_help() {
     println!("SOLANA PROGRAM SYNC");
     println!("\nUSAGE:");
@@ -1132,10 +1301,12 @@ fn print_help() {
     println!("\nCOMMANDS:");
     println!("  sync        Sync programs from RPC and download binaries");
     println!("  analyze     Analyze sBPF instructions across all programs");
+    println!("  dfg         Perform data-flow graph analysis");
     println!("  help        Show this help message");
     println!("\nFor command-specific options, use:");
     println!("  program-sync sync --help");
     println!("  program-sync analyze --help");
+    println!("  program-sync dfg --help");
     println!();
 }
 
@@ -1205,6 +1376,30 @@ fn print_analyze_help() {
     println!();
     println!("  # Show distribution of imm values for mov64 (warning: may be large!)");
     println!("  program-sync analyze --opcode mov64 --agg imm");
+    println!();
+}
+
+fn print_dfg_help() {
+    println!("DFG");
+    println!("\nUSAGE:");
+    println!("  program-sync dfg [OPTIONS]");
+    println!("\nDESCRIPTION:");
+    println!("  Perform data-flow graph analysis on downloaded program binaries.");
+    println!("\nOPTIONS:");
+    println!("  --uninit-reg <N>  Find programs that read register N before writing (0-10)");
+    println!("  --dir <PATH>      Program directory (default: programs)");
+    println!("  --disasm          Show disassembled instructions at each location");
+    println!("  --entry-only      Only show reads from program entrypoint (not internal functions)");
+    println!("  --help, -h        Show this help message");
+    println!("\nEXAMPLES:");
+    println!("  # Find programs that read r2 before writing");
+    println!("  program-sync dfg --uninit-reg 2");
+    println!();
+    println!("  # Show disassembly for each flagged instruction");
+    println!("  program-sync dfg --uninit-reg 2 --disasm");
+    println!();
+    println!("  # Only check reads from actual program entry (excludes internal function params)");
+    println!("  program-sync dfg --uninit-reg 2 --entry-only --disasm");
     println!();
 }
 
@@ -1380,8 +1575,57 @@ fn main() -> Result<()> {
 
             analyze_command(opcode, mode, program_dir)
         }
+        "dfg" => {
+            let mut uninit_reg: Option<u8> = None;
+            let mut program_dir = "programs".to_string();
+            let mut disasm = false;
+            let mut entry_only = false;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--uninit-reg" => {
+                        if i + 1 < args.len() {
+                            uninit_reg =
+                                Some(args[i + 1].parse().context("Invalid register number")?);
+                            i += 2;
+                        } else {
+                            anyhow::bail!("--uninit-reg requires a register number (0-10)");
+                        }
+                    }
+                    "--dir" => {
+                        if i + 1 < args.len() {
+                            program_dir = args[i + 1].clone();
+                            i += 2;
+                        } else {
+                            anyhow::bail!("--dir requires a directory path");
+                        }
+                    }
+                    "--disasm" => {
+                        disasm = true;
+                        i += 1;
+                    }
+                    "--entry-only" => {
+                        entry_only = true;
+                        i += 1;
+                    }
+                    "--help" | "-h" => {
+                        print_dfg_help();
+                        return Ok(());
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "Unknown argument: {}. Use 'dfg --help' for usage.",
+                            args[i]
+                        );
+                    }
+                }
+            }
+
+            dfg_command(uninit_reg, program_dir, disasm, entry_only)
+        }
         _ => {
-            anyhow::bail!("Unknown command: {}. Use 'sync' or 'analyze'", command);
+            anyhow::bail!("Unknown command: {}. Use 'sync', 'analyze', or 'dfg'", command);
         }
     }
 }

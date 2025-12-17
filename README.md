@@ -117,6 +117,66 @@ program-sync analyze --opcode jeq --count off=10
 program-sync analyze --opcode mov64 --agg imm
 ```
 
+### `dfg` - Data-Flow Graph Analysis
+
+Detect programs that read a register before writing to it using DFG analysis.
+
+```bash
+program-sync dfg --uninit-reg <N> [OPTIONS]
+```
+
+**Options:**
+- `--uninit-reg <N>` - Register to check (0-10), required
+- `--dir <PATH>` - Program directory (default: `programs`)
+- `--disasm` - Show disassembled instruction at each flagged location
+- `--entry-only` - Only show reads from program entrypoint (filters out internal function parameters)
+- `--help, -h` - Show help
+
+**How it works:**
+
+1. Builds a data-flow graph for each program using `solana-sbpf`
+2. Finds reads where the register value comes from a PhiNode (undefined at that point)
+3. Filters out EXIT instructions (false positives from liveness analysis)
+4. With `--entry-only`, only reports reads sourced from the program's actual entrypoint
+
+**Examples:**
+
+```bash
+# Find all programs that read r2 before writing
+program-sync dfg --uninit-reg 2
+
+# Show disassembly for flagged instructions
+program-sync dfg --uninit-reg 2 --disasm
+
+# Only check reads from actual program entry (excludes internal function params)
+program-sync dfg --uninit-reg 2 --entry-only --disasm
+
+# Check a different register
+program-sync dfg --uninit-reg 3 --dir test_programs
+```
+
+**Output:**
+
+```
+DFG Analysis
+============================================================
+Found 50 .so files to analyze
+Checking for uninitialized reads of r2
+
+============================================================
+RESULTS
+============================================================
+Files processed:       50
+Files with errors:     0
+
+Found 49 programs with uninitialized reads of r2:
+  12FybZF6vtVTDBSHFpwn2hNcKaK8ELWZuxJHbELYcPjV (entry=0): 1 location(s) at pc [23]
+  1252p8FBsE7dMpr3DAjkQtMN6Jfvt3RbP2YJKjW3t8z (entry=0): 2 location(s) at pc [66, 10]
+  ...
+```
+
+**Note:** Without `--entry-only`, many hits are internal functions that expect the register as a parameter (properly set by caller). Use `--entry-only` to find true uninitialized reads from program start.
+
 ## Database Schema
 
 SQLite database at `solana_programs.db`:
