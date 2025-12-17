@@ -9,7 +9,7 @@ use solana_client::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_program::pubkey::Pubkey;
-use solana_sdk::commitment_config::CommitmentConfig;
+use solana_commitment_config::CommitmentConfig;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -897,7 +897,7 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                 let mut local_counts = HashMap::<i64, usize>::new();
                 let mut local_matches = 0;
 
-                for instruction in &instructions {
+                for instruction in &instructions.0 {
                     if instruction.opcode == target_opcode {
                         let field_value = match field.as_str() {
                             "src" => instruction.src.as_ref().map(|r| r.n as i64),
@@ -1048,7 +1048,7 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
 
                 let mut local_matches = 0;
 
-                for instruction in &instructions {
+                for instruction in &instructions.0 {
                     if instruction.opcode == target_opcode {
                         // Check if instruction matches all filters
                         let mut matches_all = true;

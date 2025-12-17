@@ -1,11 +1,11 @@
 # Rust
 /target/
-Cargo.lock
 
 # Database files
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 
 # Dumped programs
 programs/
