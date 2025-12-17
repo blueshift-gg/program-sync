@@ -805,10 +805,16 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     println!("\nsBPF Instruction Analyzer");
     println!("{}", "=".repeat(60));
 
-    // Parse opcode
-    let target_opcode: Opcode = opcode_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("Invalid opcode '{}': {}", opcode_str, e))?;
+    // Parse opcode - "all" means scan all opcodes
+    let target_opcode: Option<Opcode> = if opcode_str.eq_ignore_ascii_case("all") {
+        None
+    } else {
+        Some(
+            opcode_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("Invalid opcode '{}': {}", opcode_str, e))?,
+        )
+    };
 
     // Check if directory exists
     if !Path::new(&program_dir).exists() {
@@ -823,7 +829,10 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
         .collect();
 
     println!("Found {} .so files to analyze", so_files.len());
-    println!("Analyzing opcode: {}", target_opcode);
+    match &target_opcode {
+        Some(op) => println!("Analyzing opcode: {}", op),
+        None => println!("Analyzing all opcodes"),
+    }
     println!();
 
     let pb = ProgressBar::new(so_files.len() as u64);
@@ -837,7 +846,9 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     match mode {
         AnalyzeMode::Aggregate { field } => {
             // Thread-safe counters for aggregation
-            let field_counts = Mutex::new(HashMap::<i64, usize>::new());
+            // When target_opcode is None (all), we track (opcode, field_value) pairs.
+            // When target_opcode is Some, we just track field_value.
+            let field_counts = Mutex::new(HashMap::<(Opcode, i64), usize>::new());
             let total_matches = AtomicUsize::new(0);
             let files_processed = AtomicUsize::new(0);
             let files_with_errors = AtomicUsize::new(0);
@@ -894,11 +905,15 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                     }
                 };
 
-                let mut local_counts = HashMap::<i64, usize>::new();
+                let mut local_counts = HashMap::<(Opcode, i64), usize>::new();
                 let mut local_matches = 0;
 
                 for instruction in &instructions.0 {
-                    if instruction.opcode == target_opcode {
+                    let opcode_matches = target_opcode
+                        .map(|op| instruction.opcode == op)
+                        .unwrap_or(true);
+
+                    if opcode_matches {
                         let field_value = match field.as_str() {
                             "src" => instruction.src.as_ref().map(|r| r.n as i64),
                             "dst" => instruction.dst.as_ref().map(|r| r.n as i64),
@@ -914,7 +929,9 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                         };
 
                         if let Some(value) = field_value {
-                            *local_counts.entry(value).or_insert(0) += 1;
+                            *local_counts
+                                .entry((instruction.opcode, value))
+                                .or_insert(0) += 1;
                             local_matches += 1;
                         }
                     }
@@ -923,8 +940,8 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                 // Merge local counts into global counts
                 if !local_counts.is_empty() {
                     let mut counts = field_counts.lock().unwrap();
-                    for (value, count) in local_counts {
-                        *counts.entry(value).or_insert(0) += count;
+                    for (key, count) in local_counts {
+                        *counts.entry(key).or_insert(0) += count;
                     }
                 }
 
@@ -947,7 +964,10 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
             println!("{}", "=".repeat(60));
             println!("Files processed:       {}", files_processed);
             println!("Files with errors:     {}", files_with_errors);
-            println!("Total {} instructions: {}", target_opcode, total_matches);
+            match &target_opcode {
+                Some(op) => println!("Total {} instructions: {}", op, total_matches),
+                None => println!("Total instructions:    {}", total_matches),
+            }
             println!();
 
             if !error_log.is_empty() {
@@ -960,36 +980,94 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
             }
 
             if total_matches == 0 {
-                println!("No {} instructions found!", target_opcode);
+                match &target_opcode {
+                    Some(op) => println!("No {} instructions found!", op),
+                    None => println!("No instructions found!"),
+                }
                 return Ok(());
             }
 
-            // Sort by field value
-            let mut sorted_values: Vec<_> = field_counts.iter().collect();
-            sorted_values.sort_by_key(|(value, _)| *value);
+            // Output format depends on whether we're analyzing all opcodes or a specific one.
+            if target_opcode.is_some() {
+                // Single opcode: aggregate by field value only.
+                let mut value_counts = HashMap::<i64, usize>::new();
+                for ((_, value), count) in &field_counts {
+                    *value_counts.entry(*value).or_insert(0) += count;
+                }
 
-            println!(
-                "{} instruction {} field distribution:",
-                target_opcode, field
-            );
-            println!("{}", "-".repeat(60));
-            println!(
-                "{:<15} {:<15} {:<15}",
-                field.to_uppercase(),
-                "Count",
-                "Percentage"
-            );
-            println!("{}", "-".repeat(60));
+                let mut sorted_values: Vec<_> = value_counts.iter().collect();
+                sorted_values.sort_by_key(|(value, _)| *value);
 
-            for (value, count) in sorted_values {
-                let percentage = (*count as f64 / total_matches as f64) * 100.0;
-                println!("{:<15} {:<15} {:<14.2}%", value, count, percentage);
+                println!(
+                    "{} instruction {} field distribution:",
+                    target_opcode.unwrap(),
+                    field
+                );
+                println!("{}", "-".repeat(60));
+                println!(
+                    "{:<15} {:<15} {:<15}",
+                    field.to_uppercase(),
+                    "Count",
+                    "Percentage"
+                );
+                println!("{}", "-".repeat(60));
+
+                for (value, count) in sorted_values {
+                    let percentage = (*count as f64 / total_matches as f64) * 100.0;
+                    println!("{:<15} {:<15} {:<14.2}%", value, count, percentage);
+                }
+            } else {
+                // All opcodes: long-form table with opcode column.
+                // First, calculate per-opcode totals for percentage calculation.
+                let mut opcode_totals = HashMap::<Opcode, usize>::new();
+                for ((opcode, _), count) in &field_counts {
+                    *opcode_totals.entry(*opcode).or_insert(0) += count;
+                }
+
+                let mut sorted_entries: Vec<_> = field_counts.iter().collect();
+                // Sort by opcode name, then by field value.
+                sorted_entries.sort_by(|a, b| {
+                    let opcode_cmp = a.0 .0.to_string().cmp(&b.0 .0.to_string());
+                    if opcode_cmp == std::cmp::Ordering::Equal {
+                        a.0 .1.cmp(&b.0 .1)
+                    } else {
+                        opcode_cmp
+                    }
+                });
+
+                println!(
+                    "{} field distribution by opcode:",
+                    field.to_uppercase()
+                );
+                println!("{}", "-".repeat(60));
+                println!(
+                    "{:<15} {:<15} {:<15} {:<15}",
+                    "OPCODE",
+                    field.to_uppercase(),
+                    "Count",
+                    "Percentage"
+                );
+                println!("{}", "-".repeat(60));
+
+                for ((opcode, value), count) in sorted_entries {
+                    let opcode_total = opcode_totals.get(opcode).unwrap_or(&1);
+                    let percentage = (*count as f64 / *opcode_total as f64) * 100.0;
+                    println!(
+                        "{:<15} {:<15} {:<15} {:<14.2}%",
+                        opcode.to_string(),
+                        value,
+                        count,
+                        percentage
+                    );
+                }
             }
 
             println!("{}", "=".repeat(60));
         }
 
         AnalyzeMode::Count { filters } => {
+            // When target_opcode is None (all), track counts per opcode.
+            let opcode_counts = Mutex::new(HashMap::<Opcode, usize>::new());
             let total_matches = AtomicUsize::new(0);
             let files_processed = AtomicUsize::new(0);
             let files_with_errors = AtomicUsize::new(0);
@@ -1046,10 +1124,15 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                     }
                 };
 
+                let mut local_counts = HashMap::<Opcode, usize>::new();
                 let mut local_matches = 0;
 
                 for instruction in &instructions.0 {
-                    if instruction.opcode == target_opcode {
+                    let opcode_matches = target_opcode
+                        .map(|op| instruction.opcode == op)
+                        .unwrap_or(true);
+
+                    if opcode_matches {
                         // Check if instruction matches all filters
                         let mut matches_all = true;
 
@@ -1075,8 +1158,17 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
                         }
 
                         if matches_all {
+                            *local_counts.entry(instruction.opcode).or_insert(0) += 1;
                             local_matches += 1;
                         }
+                    }
+                }
+
+                // Merge local counts into global counts.
+                if !local_counts.is_empty() {
+                    let mut counts = opcode_counts.lock().unwrap();
+                    for (opcode, count) in local_counts {
+                        *counts.entry(opcode).or_insert(0) += count;
                     }
                 }
 
@@ -1087,6 +1179,7 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
 
             pb.finish_and_clear();
 
+            let opcode_counts = opcode_counts.into_inner().unwrap();
             let total_matches = total_matches.load(Ordering::Relaxed);
             let files_processed = files_processed.load(Ordering::Relaxed);
             let files_with_errors = files_with_errors.load(Ordering::Relaxed);
@@ -1108,14 +1201,50 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
             }
 
             println!();
-            if filters.is_empty() {
-                println!("Total {} instructions: {}", target_opcode, total_matches);
-            } else {
-                print!("Total {} instructions matching", target_opcode);
-                for (field, value) in &filters {
-                    print!(" {}={}", field, value);
+
+            // Output format depends on whether we're analyzing all opcodes or a specific one.
+            if let Some(op) = target_opcode {
+                // Single opcode: simple count.
+                if filters.is_empty() {
+                    println!("Total {} instructions: {}", op, total_matches);
+                } else {
+                    print!("Total {} instructions matching", op);
+                    for (field, value) in &filters {
+                        print!(" {}={}", field, value);
+                    }
+                    println!(": {}", total_matches);
                 }
-                println!(": {}", total_matches);
+            } else {
+                // All opcodes: per-opcode table.
+                if !filters.is_empty() {
+                    print!("Instruction counts by opcode (matching");
+                    for (field, value) in &filters {
+                        print!(" {}={}", field, value);
+                    }
+                    println!("):");
+                } else {
+                    println!("Instruction counts by opcode:");
+                }
+                println!("{}", "-".repeat(60));
+                println!("{:<20} {:<15} {:<15}", "OPCODE", "Count", "Percentage");
+                println!("{}", "-".repeat(60));
+
+                // Sort by count descending.
+                let mut sorted_counts: Vec<_> = opcode_counts.iter().collect();
+                sorted_counts.sort_by(|a, b| b.1.cmp(a.1));
+
+                for (opcode, count) in &sorted_counts {
+                    let percentage = (**count as f64 / total_matches as f64) * 100.0;
+                    println!(
+                        "{:<20} {:<15} {:<14.2}%",
+                        opcode.to_string(),
+                        count,
+                        percentage
+                    );
+                }
+
+                println!("{}", "-".repeat(60));
+                println!("{:<20} {:<15}", "TOTAL", total_matches);
             }
 
             println!("{}", "=".repeat(60));
@@ -1182,7 +1311,7 @@ fn print_analyze_help() {
     println!("\nDESCRIPTION:");
     println!("  Analyze sBPF instructions across all downloaded program binaries.");
     println!("\nOPTIONS:");
-    println!("  --opcode <OPCODE>     sBPF opcode to analyze (required)");
+    println!("  --opcode <OPCODE>     sBPF opcode to analyze, or \"all\" for all opcodes (required)");
     println!("  --agg <FIELD>         Aggregate by field: src, dst, imm, or off");
     println!("  --count [FILTERS]     Count instructions (optionally with filters)");
     println!("                        Filters format: field=value,field2=value2");
@@ -1205,6 +1334,12 @@ fn print_analyze_help() {
     println!();
     println!("  # Show distribution of imm values for mov64 (warning: may be large!)");
     println!("  program-sync analyze --opcode mov64 --agg imm");
+    println!();
+    println!("  # Count all instructions with src=2 across ALL opcodes");
+    println!("  program-sync analyze --opcode all --count src=2");
+    println!();
+    println!("  # Distribution of src registers across ALL opcodes");
+    println!("  program-sync analyze --opcode all --agg src");
     println!();
 }
 
