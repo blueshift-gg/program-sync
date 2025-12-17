@@ -52,6 +52,9 @@ program-sync analyze --opcode sub32 --count imm=1
 
 # Count add64 with multiple filters
 program-sync analyze --opcode add64 --count src=1,dst=2
+
+# Count instructions with src=2 across ALL opcodes
+program-sync analyze --opcode all --count src=2
 ```
 
 ## Commands
@@ -98,7 +101,7 @@ program-sync analyze --opcode <OPCODE> [OPTIONS]
 ```
 
 **Options:**
-- `--opcode <OPCODE>` - sBPF opcode to analyze (required)
+- `--opcode <OPCODE>` - sBPF opcode to analyze, or `all` for all opcodes (required)
 - `--agg <FIELD>` - Aggregate and show distribution by field (`src`, `dst`, `imm`, `off`)
 - `--count [FILTERS]` - Count matching instructions (optionally with filters)
 - `--dir <PATH>` - Program directory (default: `programs`)
@@ -113,8 +116,14 @@ program-sync analyze --opcode add64 --agg dst
 # Count jeq instructions with specific offset
 program-sync analyze --opcode jeq --count off=10
 
-# Show all opcodes (aggregate by opcode field - not yet implemented)
+# Show distribution of imm values for mov64
 program-sync analyze --opcode mov64 --agg imm
+
+# Count instructions with src=2 across ALL opcodes
+program-sync analyze --opcode all --count src=2
+
+# Distribution of src registers across ALL opcodes
+program-sync analyze --opcode all --agg src
 ```
 
 ## Database Schema
