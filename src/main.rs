@@ -1269,15 +1269,11 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     Ok(())
 }
 
-fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_only: bool) -> Result<()> {
+fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool) -> Result<()> {
     let target_register = uninit_reg.ok_or_else(|| anyhow::anyhow!("--uninit-reg <N> is required"))?;
 
     println!("\nDFG Analysis");
     println!("{}", "=".repeat(60));
-    if entry_only {
-        println!("Mode: entry-only (filtering for reads from program entrypoint)");
-    }
-
     if !Path::new(&program_dir).exists() {
         anyhow::bail!("Directory '{}' not found. Run sync first.", program_dir);
     }
@@ -1602,7 +1598,6 @@ fn print_dfg_help() {
     println!("  --uninit-reg <N>  Find programs that read register N before writing (0-10)");
     println!("  --dir <PATH>      Program directory (default: programs)");
     println!("  --disasm          Show disassembled instructions at each location");
-    println!("  --entry-only      Only show reads from program entrypoint (not internal functions)");
     println!("  --help, -h        Show this help message");
     println!("\nEXAMPLES:");
     println!("  # Find programs that read r2 before writing");
@@ -1611,8 +1606,6 @@ fn print_dfg_help() {
     println!("  # Show disassembly for each flagged instruction");
     println!("  program-sync dfg --uninit-reg 2 --disasm");
     println!();
-    println!("  # Only check reads from actual program entry (excludes internal function params)");
-    println!("  program-sync dfg --uninit-reg 2 --entry-only --disasm");
     println!();
 }
 
@@ -1792,8 +1785,6 @@ fn main() -> Result<()> {
             let mut uninit_reg: Option<u8> = None;
             let mut program_dir = "programs".to_string();
             let mut disasm = false;
-            let mut entry_only = false;
-
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1818,10 +1809,6 @@ fn main() -> Result<()> {
                         disasm = true;
                         i += 1;
                     }
-                    "--entry-only" => {
-                        entry_only = true;
-                        i += 1;
-                    }
                     "--help" | "-h" => {
                         print_dfg_help();
                         return Ok(());
@@ -1835,7 +1822,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            dfg_command(uninit_reg, program_dir, disasm, entry_only)
+            dfg_command(uninit_reg, program_dir, disasm)
         }
         _ => {
             anyhow::bail!("Unknown command: {}. Use 'sync', 'analyze', or 'dfg'", command);
