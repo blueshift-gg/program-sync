@@ -1269,7 +1269,7 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     Ok(())
 }
 
-fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool) -> Result<()> {
+fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, skip_calls: bool) -> Result<()> {
     let target_register = uninit_reg.ok_or_else(|| anyhow::anyhow!("--uninit-reg <N> is required"))?;
 
     println!("\nDFG Analysis");
@@ -1432,6 +1432,16 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool) -> Res
                         if let Some(i) = insn {
                             if i.opc == 0x95 {
                                 continue;
+                            }
+                        }
+
+                        // Skip CALL instructions (they conservatively read
+                        // r1-r5 as argument registers, causing false positives).
+                        if skip_calls {
+                            if let Some(i) = insn {
+                                if i.opc == 0x85 {
+                                    continue;
+                                }
                             }
                         }
 
@@ -1598,6 +1608,7 @@ fn print_dfg_help() {
     println!("  --uninit-reg <N>  Find programs that read register N before writing (0-10)");
     println!("  --dir <PATH>      Program directory (default: programs)");
     println!("  --disasm          Show disassembled instructions at each location");
+    println!("  --skip-calls      Skip hits on call instructions (reduces false positives)");
     println!("  --help, -h        Show this help message");
     println!("\nEXAMPLES:");
     println!("  # Find programs that read r2 before writing");
@@ -1785,6 +1796,7 @@ fn main() -> Result<()> {
             let mut uninit_reg: Option<u8> = None;
             let mut program_dir = "programs".to_string();
             let mut disasm = false;
+            let mut skip_calls = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1809,6 +1821,10 @@ fn main() -> Result<()> {
                         disasm = true;
                         i += 1;
                     }
+                    "--skip-calls" => {
+                        skip_calls = true;
+                        i += 1;
+                    }
                     "--help" | "-h" => {
                         print_dfg_help();
                         return Ok(());
@@ -1822,7 +1838,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            dfg_command(uninit_reg, program_dir, disasm)
+            dfg_command(uninit_reg, program_dir, disasm, skip_calls)
         }
         _ => {
             anyhow::bail!("Unknown command: {}. Use 'sync', 'analyze', or 'dfg'", command);
