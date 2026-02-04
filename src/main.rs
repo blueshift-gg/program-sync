@@ -7,6 +7,7 @@ use sbpf_common::opcode::Opcode;
 use sbpf_disassembler::program::Program;
 use solana_client::rpc_client::RpcClient;
 use solana_sbpf::{
+    ebpf,
     elf::Executable,
     program::BuiltinProgram,
     static_analysis::{Analysis, DataResource, DfgEdgeKind, DfgNode},
@@ -1430,7 +1431,7 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, skip_c
 
                         // Skip EXIT instructions.
                         if let Some(i) = insn {
-                            if i.opc == 0x95 {
+                            if i.opc == ebpf::EXIT {
                                 continue;
                             }
                         }
@@ -1439,7 +1440,7 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, skip_c
                         // r1-r5 as argument registers, causing false positives).
                         if skip_calls {
                             if let Some(i) = insn {
-                                if i.opc == 0x85 {
+                                if i.opc == ebpf::CALL_IMM {
                                     continue;
                                 }
                             }
