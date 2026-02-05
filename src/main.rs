@@ -7,6 +7,7 @@ use sbpf_common::opcode::Opcode;
 use sbpf_disassembler::program::Program;
 use solana_client::rpc_client::RpcClient;
 use solana_sbpf::{
+    ebpf,
     elf::Executable,
     program::BuiltinProgram,
     static_analysis::{Analysis, DataResource, DfgEdgeKind, DfgNode},
@@ -1269,15 +1270,11 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
     Ok(())
 }
 
-fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_only: bool) -> Result<()> {
-    let register = uninit_reg.ok_or_else(|| anyhow::anyhow!("--uninit-reg <N> is required"))?;
+fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, skip_calls: bool) -> Result<()> {
+    let target_register = uninit_reg.ok_or_else(|| anyhow::anyhow!("--uninit-reg <N> is required"))?;
 
     println!("\nDFG Analysis");
     println!("{}", "=".repeat(60));
-    if entry_only {
-        println!("Mode: entry-only (filtering for reads from program entrypoint)");
-    }
-
     if !Path::new(&program_dir).exists() {
         anyhow::bail!("Directory '{}' not found. Run sync first.", program_dir);
     }
@@ -1289,7 +1286,7 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_
         .collect();
 
     println!("Found {} .so files to analyze", so_files.len());
-    println!("Checking for uninitialized reads of r{}", register);
+    println!("Checking for uninitialized reads of r{}", target_register);
     println!();
 
     let pb = ProgressBar::new(so_files.len() as u64);
@@ -1336,41 +1333,129 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_
             }
         };
 
-        // Find uninitialized reads: PhiNode-sourced Filled edges on target register.
-        let resource = DataResource::Register(register);
-        let mut uninit_locs: Vec<(usize, String)> = Vec::new();
+        // Find uninitialized reads of the specified register.
+        //
+        // Uninitialized read: an instruction reads a register whose value was
+        // never written by a prior instruction — it comes from the initial
+        // (uninitialized) program state at the entrypoint.
+        //
+        // ## How This Analysis Works
+        //
+        // The `solana-sbpf` crate builds a data-flow graph (DFG) on top of
+        // the control-flow graph (CFG), which is available through the
+        // `Analysis` API.
+        //
+        // `Analysis` holds `dfg_reverse_edges`, keyed by destination node:
+        //
+        // ```rust
+        //   dfg_reverse_edges: BTreeMap<DfgNode, BTreeSet<DfgEdge>>,
+        // ```
+        //
+        // Each `DfgEdge` connects a source `DfgNode` to the destination
+        // `DfgNode` stored in the key. Nodes are:
+        // * `InstructionNode(pc)`: a single instruction
+        // * `PhiNode(pc)`: merged register state at a basic block entry
+        //
+        // The edge **kind** is `Filled` when the destination reads the
+        // resource, or `Empty` when it overwrites without reading.
+        //
+        // When an instruction reads a register, the DFG looks up the last
+        // instruction that wrote it. If no prior write exists, the source
+        // defaults to `PhiNode(basic_block_start)`, meaning the value was
+        // inherited from outside the block. A `PhiNode(0)` source means
+        // this value was assumed to be made available at the entrypoint.
+        //
+        // ## Example
+        //
+        // Consider the simple test program in Agave's sbf corpus, located at
+        // programs/sbf/rust/r2_instruction_data_pointer.
+        //
+        // It simply reads from r2 and sets the return data.
+        //
+        // ```rust
+        // extern "C" fn entrypoint(_input: *mut u8, addr: *const u8) -> u64 {
+        //   let len = *((addr as u64 - 8) as *const u64);
+        //   let data = core::slice::from_raw_parts(addr, len as usize);
+        //   solana_cpi::set_return_data(data);
+        //   solana_program_entrypoint::SUCCESS
+        // }
+        // ```
+        //
+        // Here's the entrypoint function disassembly:
+        //
+        // ```asm
+        //   [0] r1 = r2              (reads r2, writes r1)
+        //   [1] r2 = *(u64*)(r1-8)   (reads r1, writes r2)
+        //   [2] call sol_set_return_data
+        //   [3] r0 = 0
+        //   [4] exit
+        // ```
+        //
+        // The DFG reverse edges for InstructionNode(0) show:
+        //
+        //   PhiNode(0) ──[Register(2), Filled]──> InstructionNode(0)
+        //       │                                       │
+        //       │        "r2 was never written;         │
+        //       │         its value comes from          │
+        //       │         the initial program state"    │
+        //       │                                       │
+        //       └──[Register(1), Empty]─────────────────┘
+        //                  "r1 is overwritten (not read)
+        //                   by instruction 0"
+        //
+        // The `Filled` edge on `Register(2)` from `PhiNode(0)` tells us
+        // instruction 0 reads r2 and no prior instruction wrote it.
+        // That's an uninitialized read.
+        //
+        // ## Detection
+        //
+        // Iterate `dfg_reverse_edges`. For each `InstructionNode`, check if
+        // any incoming edge has:
+        //   * source == `PhiNode(entrypoint)`
+        //   * resource == `Register(target_register)`
+        //   * kind == `Filled`
+        //
+        let target_resource = DataResource::Register(target_register);
         let entrypoint = analysis.entrypoint;
-
-        for (node, edges) in &analysis.dfg_forward_edges {
-            if let DfgNode::PhiNode(phi_pc) = node {
-                // If --entry-only, skip PhiNodes that aren't at the entrypoint.
-                if entry_only && *phi_pc != entrypoint {
-                    continue;
-                }
-
+        let phi_entry = DfgNode::PhiNode(entrypoint);
+        
+        let mut uninit_locs: Vec<(usize, String)> = Vec::new();
+        for (node, edges) in &analysis.dfg_reverse_edges {
+            if let DfgNode::InstructionNode(pc) = node {
                 for edge in edges {
-                    if edge.resource == resource && edge.kind == DfgEdgeKind::Filled {
-                        if let DfgNode::InstructionNode(pc) = edge.destination {
-                            let insn = analysis.instructions.iter().find(|i| i.ptr == pc);
+                    if edge.source == phi_entry
+                        && edge.resource == target_resource
+                        && edge.kind == DfgEdgeKind::Filled
+                    {
+                        let insn = analysis.instructions.iter().find(|i| i.ptr == *pc);
 
-                            // Skip EXIT instructions.
+                        // Skip EXIT instructions.
+                        if let Some(i) = insn {
+                            if i.opc == ebpf::EXIT {
+                                continue;
+                            }
+                        }
+
+                        // Skip CALL instructions (they conservatively read
+                        // r1-r5 as argument registers, causing false positives).
+                        if skip_calls {
                             if let Some(i) = insn {
-                                if i.opc == 0x95 {
+                                if i.opc == ebpf::CALL_IMM {
                                     continue;
                                 }
                             }
-
-                            let disasm_text = if disasm {
-                                if let Some(i) = insn {
-                                    analysis.disassemble_instruction(i, pc)
-                                } else {
-                                    format!("<pc {} not found>", pc)
-                                }
-                            } else {
-                                String::new()
-                            };
-                            uninit_locs.push((pc, disasm_text));
                         }
+
+                        let disasm_text = if disasm {
+                            if let Some(i) = insn {
+                                analysis.disassemble_instruction(i, *pc)
+                            } else {
+                                format!("<pc {} not found>", pc)
+                            }
+                        } else {
+                            String::new()
+                        };
+                        uninit_locs.push((*pc, disasm_text));
                     }
                 }
             }
@@ -1399,12 +1484,12 @@ fn dfg_command(uninit_reg: Option<u8>, program_dir: String, disasm: bool, entry_
     println!();
 
     if issues.is_empty() {
-        println!("No programs with uninitialized reads of r{} found", register);
+        println!("No programs with uninitialized reads of r{} found", target_register);
     } else {
         println!(
             "Found {} programs with uninitialized reads of r{}:",
             issues.len(),
-            register
+            target_register
         );
         for (pubkey, locs, entrypoint) in &issues {
             if disasm {
@@ -1524,7 +1609,7 @@ fn print_dfg_help() {
     println!("  --uninit-reg <N>  Find programs that read register N before writing (0-10)");
     println!("  --dir <PATH>      Program directory (default: programs)");
     println!("  --disasm          Show disassembled instructions at each location");
-    println!("  --entry-only      Only show reads from program entrypoint (not internal functions)");
+    println!("  --skip-calls      Skip hits on call instructions (reduces false positives)");
     println!("  --help, -h        Show this help message");
     println!("\nEXAMPLES:");
     println!("  # Find programs that read r2 before writing");
@@ -1533,8 +1618,6 @@ fn print_dfg_help() {
     println!("  # Show disassembly for each flagged instruction");
     println!("  program-sync dfg --uninit-reg 2 --disasm");
     println!();
-    println!("  # Only check reads from actual program entry (excludes internal function params)");
-    println!("  program-sync dfg --uninit-reg 2 --entry-only --disasm");
     println!();
 }
 
@@ -1714,8 +1797,7 @@ fn main() -> Result<()> {
             let mut uninit_reg: Option<u8> = None;
             let mut program_dir = "programs".to_string();
             let mut disasm = false;
-            let mut entry_only = false;
-
+            let mut skip_calls = false;
             let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
@@ -1740,8 +1822,8 @@ fn main() -> Result<()> {
                         disasm = true;
                         i += 1;
                     }
-                    "--entry-only" => {
-                        entry_only = true;
+                    "--skip-calls" => {
+                        skip_calls = true;
                         i += 1;
                     }
                     "--help" | "-h" => {
@@ -1757,7 +1839,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            dfg_command(uninit_reg, program_dir, disasm, entry_only)
+            dfg_command(uninit_reg, program_dir, disasm, skip_calls)
         }
         _ => {
             anyhow::bail!("Unknown command: {}. Use 'sync', 'analyze', or 'dfg'", command);
