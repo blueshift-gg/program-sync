@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use rpc::{
     ProgramAccount, derive_programdata_address, fetch_all_programdata_accounts,
-    fetch_programs_for_loader, parse_programdata,
+    fetch_programs_for_loader, loader_version_name, parse_programdata,
 };
 
 /// Dummy context object for static analysis (no execution needed)
@@ -480,15 +480,7 @@ fn sync_command(
     let mut total_errors = 0;
 
     for loader_version in &loader_versions {
-        let loader_name = match loader_version {
-            1 => "BPFLoader v1",
-            2 => "BPFLoader v2",
-            3 => "BPFLoaderUpgradeable",
-            4 => "LoaderV4",
-            _ => "Unknown",
-        };
-
-        println!("{}:", loader_name);
+        println!("{}:", loader_version_name(*loader_version));
 
         let programs = fetch_programs_for_loader(&rpc_client, *loader_version)?;
 
@@ -1265,14 +1257,57 @@ fn print_help() {
     println!("\nUSAGE:");
     println!("  program-sync <COMMAND> [OPTIONS]");
     println!("\nCOMMANDS:");
+    println!("  rpc         Query Solana RPC for program information");
     println!("  sync        Sync programs from RPC and download binaries");
     println!("  analyze     Analyze sBPF instructions across all programs");
     println!("  dfg         Perform data-flow graph analysis");
     println!("  help        Show this help message");
     println!("\nFor command-specific options, use:");
+    println!("  program-sync rpc --help");
     println!("  program-sync sync --help");
     println!("  program-sync analyze --help");
     println!("  program-sync dfg --help");
+    println!();
+}
+
+fn print_rpc_help() {
+    println!("RPC");
+    println!("\nUSAGE:");
+    println!("  program-sync rpc <SUBCOMMAND> [OPTIONS]");
+    println!("\nSUBCOMMANDS:");
+    println!("  program-ids   Fetch active program IDs and write them to a file");
+    println!("\nFor subcommand-specific options, use:");
+    println!("  program-sync rpc program-ids --help");
+    println!();
+}
+
+fn print_rpc_program_ids_help() {
+    println!("RPC PROGRAM-IDS");
+    println!("\nUSAGE:");
+    println!("  program-sync rpc program-ids [OPTIONS]");
+    println!("\nDESCRIPTION:");
+    println!("  Query Solana RPC for active program accounts and write their program");
+    println!("  IDs to per-loader files. Each file contains only program IDs, one per");
+    println!("  line. Loaders with no active programs are skipped.");
+    println!("\nOPTIONS:");
+    println!("  --loader <VERSION>    Loader version (1-4), can be specified multiple times");
+    println!("                        Default: all loaders (1-4) if not specified");
+    println!("  --rpc-url <URL>       RPC endpoint URL");
+    println!("                        Default: RPC_ENDPOINT env var or mainnet");
+    println!("  --help, -h            Show this help message");
+    println!("\nLOADER VERSIONS:");
+    println!("  1  BPFLoader v1");
+    println!("  2  BPFLoader v2");
+    println!("  3  BPFLoaderUpgradeable  (most common)");
+    println!("  4  LoaderV4  (experimental)");
+    println!("\nOUTPUT:");
+    println!("  One file per loader: rpc-out/<timestamp>-program-ids-<network>-<loader>.txt");
+    println!("\nEXAMPLES:");
+    println!("  # Dump program IDs for all loaders");
+    println!("  program-sync rpc program-ids");
+    println!();
+    println!("  # Dump program IDs for BPFLoaderUpgradeable only");
+    println!("  program-sync rpc program-ids --loader 3");
     println!();
 }
 
@@ -1397,6 +1432,74 @@ fn main() -> Result<()> {
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
+        }
+        "rpc" => {
+            if args.len() < 3 {
+                print_rpc_help();
+                std::process::exit(1);
+            }
+
+            let subcommand = &args[2];
+            match subcommand.as_str() {
+                "help" | "--help" | "-h" => {
+                    print_rpc_help();
+                    Ok(())
+                }
+                "program-ids" => {
+                    let mut loader_versions = Vec::new();
+                    let mut rpc_url = std::env::var("RPC_ENDPOINT")
+                        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned());
+
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--loader" => {
+                                if i + 1 < args.len() {
+                                    let version: i32 =
+                                        args[i + 1].parse().context("Invalid loader version")?;
+                                    if !(1..=4).contains(&version) {
+                                        anyhow::bail!("Loader version must be between 1 and 4");
+                                    }
+                                    loader_versions.push(version);
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--loader requires a version argument");
+                                }
+                            }
+                            "--rpc-url" => {
+                                if i + 1 < args.len() {
+                                    rpc_url = args[i + 1].clone();
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--rpc-url requires a URL argument");
+                                }
+                            }
+                            "--help" | "-h" => {
+                                print_rpc_program_ids_help();
+                                return Ok(());
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "Unknown argument: {}. Use 'rpc program-ids --help' for usage.",
+                                    args[i]
+                                );
+                            }
+                        }
+                    }
+
+                    if loader_versions.is_empty() {
+                        loader_versions = vec![1, 2, 3, 4];
+                    }
+
+                    rpc::program_ids_command(loader_versions, rpc_url)
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unknown rpc subcommand: {}. Use 'rpc --help' for usage.",
+                        subcommand
+                    );
+                }
+            }
         }
         "sync" => {
             let mut loader_versions = Vec::new();
@@ -1594,7 +1697,7 @@ fn main() -> Result<()> {
             dfg_command(uninit_reg, program_dir, disasm, skip_calls)
         }
         _ => {
-            anyhow::bail!("Unknown command: {}. Use 'sync', 'analyze', or 'dfg'", command);
+            anyhow::bail!("Unknown command: {}. Use 'rpc', 'sync', 'analyze', or 'dfg'", command);
         }
     }
 }
