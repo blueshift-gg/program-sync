@@ -1276,8 +1276,9 @@ fn print_rpc_help() {
     println!("  program-sync rpc <SUBCOMMAND> [OPTIONS]");
     println!("\nSUBCOMMANDS:");
     println!("  program-ids   Fetch active program IDs and write them to a file");
+    println!("  usage         Fetch transaction usage for a list of program IDs");
     println!("\nFor subcommand-specific options, use:");
-    println!("  program-sync rpc program-ids --help");
+    println!("  program-sync rpc <SUBCOMMAND> --help");
     println!();
 }
 
@@ -1308,6 +1309,38 @@ fn print_rpc_program_ids_help() {
     println!();
     println!("  # Dump program IDs for BPFLoaderUpgradeable only");
     println!("  program-sync rpc program-ids --loader 3");
+    println!();
+}
+
+fn print_rpc_usage_help() {
+    println!("RPC USAGE");
+    println!("\nUSAGE:");
+    println!("  program-sync rpc usage --id <ID> [--id <ID> ...] [OPTIONS]");
+    println!("  program-sync rpc usage --file <FILE> [OPTIONS]");
+    println!("\nDESCRIPTION:");
+    println!("  Fetch transaction signature counts for a list of program IDs using");
+    println!("  getSignaturesForAddress (clamped to 300). Shows per-program signature");
+    println!("  count, slot range, elapsed slots from current, and a distribution");
+    println!("  sparkline. Results are appended to the output file as each program");
+    println!("  is processed, so partial runs are recoverable.");
+    println!("\nOPTIONS:");
+    println!("  --id <ID>         Program ID, can be specified multiple times");
+    println!("  --file <FILE>     File containing program IDs, one per line");
+    println!("                    (e.g. output of 'rpc program-ids')");
+    println!("  --rpc-url <URL>   RPC endpoint URL");
+    println!("                    Default: RPC_ENDPOINT env var or mainnet");
+    println!("  --help, -h        Show this help message");
+    println!("\nRATE LIMITING:");
+    println!("  Programs are processed in chunks of 10 with a 5-second sleep");
+    println!("  between chunks to avoid RPC rate limits.");
+    println!("\nOUTPUT:");
+    println!("  File: rpc-out/<timestamp>-usage-<network>.txt");
+    println!("\nEXAMPLES:");
+    println!("  # Check usage for specific programs");
+    println!("  program-sync rpc usage --id TokenkegQ... --id Vote111...");
+    println!();
+    println!("  # Check usage for all programs from a program-ids output file");
+    println!("  program-sync rpc usage --file rpc-out/1234-program-ids-mainnet-upgradeable.txt");
     println!();
 }
 
@@ -1492,6 +1525,59 @@ fn main() -> Result<()> {
                     }
 
                     rpc::program_ids_command(loader_versions, rpc_url)
+                }
+                "usage" => {
+                    let mut ids: Vec<String> = Vec::new();
+                    let mut file: Option<String> = None;
+                    let mut rpc_url = std::env::var("RPC_ENDPOINT")
+                        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned());
+
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--id" => {
+                                if i + 1 < args.len() {
+                                    ids.push(args[i + 1].clone());
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--id requires a program ID");
+                                }
+                            }
+                            "--file" => {
+                                if i + 1 < args.len() {
+                                    file = Some(args[i + 1].clone());
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--file requires a file path");
+                                }
+                            }
+                            "--rpc-url" => {
+                                if i + 1 < args.len() {
+                                    rpc_url = args[i + 1].clone();
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--rpc-url requires a URL argument");
+                                }
+                            }
+                            "--help" | "-h" => {
+                                print_rpc_usage_help();
+                                return Ok(());
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "Unknown argument: {}. Use 'rpc usage --help' for usage.",
+                                    args[i]
+                                );
+                            }
+                        }
+                    }
+
+                    if ids.is_empty() && file.is_none() {
+                        print_rpc_usage_help();
+                        anyhow::bail!("Either --ids or --file must be specified");
+                    }
+
+                    rpc::usage_command(ids, file, rpc_url)
                 }
                 _ => {
                     anyhow::bail!(
