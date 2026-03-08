@@ -6,6 +6,8 @@ use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_program::pubkey::Pubkey;
 use solana_commitment_config::CommitmentConfig;
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
 use std::str::FromStr;
 
 /// Loader program IDs and their versions
@@ -48,6 +50,39 @@ pub fn loader_to_version(loader: &str) -> i32 {
         BPF_LOADER_UPGRADEABLE => 3,
         LOADER_V4 => 4,
         _ => -1,
+    }
+}
+
+/// Human-readable loader name for display.
+pub fn loader_version_name(version: i32) -> &'static str {
+    match version {
+        1 => "BPFLoader v1",
+        2 => "BPFLoader v2",
+        3 => "BPFLoaderUpgradeable",
+        4 => "LoaderV4",
+        _ => "Unknown",
+    }
+}
+
+/// Short loader version label for file naming.
+fn loader_version_label(version: i32) -> &'static str {
+    match version {
+        1 => "v1",
+        2 => "v2",
+        3 => "upgradeable",
+        4 => "v4",
+        _ => "unknown",
+    }
+}
+
+/// Resolve the RPC network name from the URL for file naming.
+fn rpc_network_name(rpc_url: &str) -> &str {
+    if rpc_url.contains("devnet") {
+        "devnet"
+    } else if rpc_url.contains("testnet") {
+        "testnet"
+    } else {
+        "mainnet"
     }
 }
 
@@ -258,4 +293,82 @@ pub fn fetch_all_programdata_accounts(rpc_client: &RpcClient) -> Result<HashMap<
         programdata_map.len()
     ));
     Ok(programdata_map)
+}
+
+/// RPC program-ids command: query for active programs and write their IDs
+/// to per-loader files. Each file contains only program IDs, one per line.
+pub fn program_ids_command(
+    loader_versions: Vec<i32>,
+    rpc_url: String,
+) -> Result<()> {
+    let network = rpc_network_name(&rpc_url);
+    let rpc_client = RpcClient::new(&rpc_url);
+
+    let output_dir = "rpc-out";
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("Failed to get system time")?
+        .as_secs();
+
+    fs::create_dir_all(output_dir).context("Failed to create output directory")?;
+
+    println!("\nRPC Program IDs");
+    println!("Network:  {}", network);
+    println!("Output:   {}/", output_dir);
+    println!();
+
+    // For v3, pre-fetch ProgramData accounts to verify which programs are active.
+    let programdata_slots: HashMap<Pubkey, u64> = if loader_versions.contains(&3) {
+        fetch_all_programdata_accounts(&rpc_client)?
+    } else {
+        HashMap::new()
+    };
+
+    let mut grand_total: usize = 0;
+
+    for loader_version in &loader_versions {
+        let loader_name = loader_version_name(*loader_version);
+
+        let programs = fetch_programs_for_loader(&rpc_client, *loader_version)?;
+
+        // For v3, filter to only programs with a known ProgramData account
+        // (i.e. the program is active and has an ELF deployed).
+        let program_ids: Vec<Pubkey> = if *loader_version == 3 {
+            programs
+                .into_iter()
+                .filter(|(pubkey, ..)| {
+                    derive_programdata_address(pubkey)
+                        .ok()
+                        .is_some_and(|pd| programdata_slots.contains_key(&pd))
+                })
+                .map(|(pubkey, ..)| pubkey)
+                .collect()
+        } else {
+            programs.into_iter().map(|(pubkey, ..)| pubkey).collect()
+        };
+
+        let count = program_ids.len();
+        if count == 0 {
+            println!("{}:  0 programs (skipped)", loader_name);
+            continue;
+        }
+
+        grand_total += count;
+
+        let file_path = format!(
+            "{}/{}-program-ids-{}-{}.txt",
+            output_dir, timestamp, network, loader_version_label(*loader_version)
+        );
+        let mut file = File::create(&file_path)
+            .with_context(|| format!("Failed to create {}", file_path))?;
+        for pubkey in &program_ids {
+            writeln!(file, "{}", pubkey)?;
+        }
+
+        println!("{}:  {} programs -> {}", loader_name, count, file_path);
+    }
+
+    println!("\nTotal:  {} programs", grand_total);
+
+    Ok(())
 }
