@@ -59,6 +59,80 @@ program-sync analyze --opcode all --count src=2
 
 ## Commands
 
+### `rpc` - Query RPC
+
+Query Solana RPC for program information.
+
+```bash
+program-sync rpc <SUBCOMMAND> [OPTIONS]
+```
+
+**Subcommands:**
+- `program-ids` - Fetch active program IDs and write them to a
+  file
+- `usage` - Fetch transaction usage for a list of program IDs
+
+#### `rpc program-ids` - Fetch Program IDs
+
+Query Solana RPC for active program accounts and write their
+program IDs to per-loader files (one ID per line).
+
+```bash
+program-sync rpc program-ids [OPTIONS]
+```
+
+**Options:**
+- `--loader <VERSION>` - Loader version (1-4), repeatable
+  (default: all loaders)
+- `--rpc-url <URL>` - Custom RPC endpoint
+- `--help, -h` - Show help
+
+**Output:** `rpc-out/<timestamp>-program-ids-<network>-<loader>.txt`
+
+**Examples:**
+
+```bash
+# Dump program IDs for all loaders
+program-sync rpc program-ids
+
+# Dump program IDs for BPFLoaderUpgradeable only
+program-sync rpc program-ids --loader 3
+```
+
+#### `rpc usage` - Fetch Transaction Usage
+
+Fetch transaction signature counts for a list of program IDs.
+Shows per-program signature count, slot range, age, and a
+distribution sparkline. Results are appended to the output file
+as each program is processed, so partial runs are recoverable.
+
+```bash
+program-sync rpc usage --id <ID> [--id <ID> ...] [OPTIONS]
+program-sync rpc usage --file <FILE> [OPTIONS]
+```
+
+**Options:**
+- `--id <ID>` - Program ID, repeatable
+- `--file <FILE>` - File containing program IDs, one per line
+  (e.g. output of `rpc program-ids`)
+- `--rpc-url <URL>` - Custom RPC endpoint
+- `--help, -h` - Show help
+
+**Rate Limiting:** Programs are processed in chunks of 10 with a
+5-second sleep between chunks.
+
+**Output:** `rpc-out/<timestamp>-usage-<network>.txt`
+
+**Examples:**
+
+```bash
+# Check usage for specific programs
+program-sync rpc usage --id TokenkegQ... --id Vote111...
+
+# Check usage for all programs from a program-ids output file
+program-sync rpc usage --file rpc-out/1234-program-ids-mainnet-upgradeable.txt
+```
+
 ### `sync` - Download Programs
 
 Fetch programs from Solana RPC and save their binaries locally.
