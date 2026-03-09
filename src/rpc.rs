@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClient};
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 use solana_program::pubkey::Pubkey;
 use solana_commitment_config::CommitmentConfig;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::str::FromStr;
 
 /// Loader program IDs and their versions
@@ -369,6 +369,294 @@ pub fn program_ids_command(
     }
 
     println!("\nTotal:  {} programs", grand_total);
+
+    Ok(())
+}
+
+/// Parse program IDs from either repeated `--id` args or a file.
+fn parse_program_ids(ids: Vec<String>, file: Option<String>) -> Result<Vec<Pubkey>> {
+    let raw: Vec<String> = if !ids.is_empty() {
+        ids
+    } else if let Some(file_path) = file {
+        let f = File::open(&file_path)
+            .with_context(|| format!("Failed to open file: {}", file_path))?;
+        BufReader::new(f)
+            .lines()
+            .filter_map(|line| {
+                let line = line.ok()?;
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            })
+            .collect()
+    } else {
+        anyhow::bail!("Either --ids or --file must be specified");
+    };
+
+    if raw.is_empty() {
+        anyhow::bail!("No program IDs provided");
+    }
+
+    raw.iter()
+        .map(|s| {
+            Pubkey::from_str(s.trim())
+                .with_context(|| format!("Invalid program ID: {}", s))
+        })
+        .collect()
+}
+
+const USAGE_SIG_LIMIT: usize = 300;
+const USAGE_CHUNK_SIZE: usize = 10;
+const USAGE_CHUNK_SLEEP_SECS: u64 = 5;
+
+/// Build a slot distribution sparkline for a set of signature slots.
+///
+/// Divides the range [oldest_slot, current_slot] into `num_buckets` equal-width
+/// buckets and counts how many signatures land in each. Returns a string like
+/// "▁▂▅▇█" where left = oldest, right = most recent.
+fn slot_sparkline(sig_slots: &[u64], current_slot: u64, num_buckets: usize) -> String {
+    if sig_slots.is_empty() || num_buckets == 0 {
+        return String::new();
+    }
+
+    let oldest = *sig_slots.iter().min().unwrap();
+    let range = current_slot.saturating_sub(oldest);
+    if range == 0 {
+        // All signatures in same slot
+        return "█".repeat(num_buckets);
+    }
+
+    let bucket_width = (range as f64) / (num_buckets as f64);
+    let mut buckets = vec![0u32; num_buckets];
+
+    for &slot in sig_slots {
+        let idx = ((slot.saturating_sub(oldest) as f64) / bucket_width) as usize;
+        let idx = idx.min(num_buckets - 1);
+        buckets[idx] += 1;
+    }
+
+    let max_count = *buckets.iter().max().unwrap_or(&1);
+    let bars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    buckets
+        .iter()
+        .map(|&count| {
+            if count == 0 {
+                ' '
+            } else {
+                let level = ((count as f64 / max_count as f64) * 7.0) as usize;
+                bars[level.min(7)]
+            }
+        })
+        .collect()
+}
+
+/// Format a slot count with a human-readable time estimate.
+/// Solana produces roughly 2.5 slots/sec → ~400ms per slot.
+fn format_slot_age(elapsed_slots: u64) -> String {
+    let seconds = elapsed_slots as f64 * 0.4;
+    if seconds < 60.0 {
+        format!("{:.0}s", seconds)
+    } else if seconds < 3600.0 {
+        format!("{:.1}m", seconds / 60.0)
+    } else if seconds < 86400.0 {
+        format!("{:.1}h", seconds / 3600.0)
+    } else {
+        format!("{:.1}d", seconds / 86400.0)
+    }
+}
+
+/// Result for a single program's usage query.
+struct UsageResult {
+    sig_count: usize,
+    oldest_slot: Option<u64>,
+    newest_slot: Option<u64>,
+    sig_slots: Vec<u64>,
+}
+
+/// Fetch usage signatures for a single program.
+fn fetch_usage_for_program(
+    rpc_client: &RpcClient,
+    pubkey: &Pubkey,
+) -> Result<UsageResult> {
+    let config = GetConfirmedSignaturesForAddress2Config {
+        limit: Some(USAGE_SIG_LIMIT),
+        commitment: Some(CommitmentConfig::confirmed()),
+        ..Default::default()
+    };
+
+    let sigs = rpc_client
+        .get_signatures_for_address_with_config(pubkey, config)
+        .with_context(|| format!("Failed to get signatures for {}", pubkey))?;
+
+    let sig_count = sigs.len();
+    let sig_slots: Vec<u64> = sigs.iter().map(|s| s.slot).collect();
+    let oldest_slot = sig_slots.iter().copied().min();
+    let newest_slot = sig_slots.iter().copied().max();
+
+    Ok(UsageResult {
+        sig_count,
+        oldest_slot,
+        newest_slot,
+        sig_slots,
+    })
+}
+
+/// RPC usage command: fetch transaction signature counts for a list of program
+/// IDs. Outputs per-program stats to stdout and appends to a file under
+/// `rpc-out/` as each program is processed.
+pub fn usage_command(
+    ids: Vec<String>,
+    file: Option<String>,
+    rpc_url: String,
+) -> Result<()> {
+    let program_ids = parse_program_ids(ids, file)?;
+    let network = rpc_network_name(&rpc_url);
+    let rpc_client = RpcClient::new(&rpc_url);
+
+    let output_dir = "rpc-out";
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("Failed to get system time")?
+        .as_secs();
+
+    fs::create_dir_all(output_dir).context("Failed to create output directory")?;
+
+    let file_path = format!("{}/{}-usage-{}.txt", output_dir, timestamp, network);
+
+    // Get current slot upfront (use confirmed to match signature queries).
+    let current_slot = rpc_client
+        .get_slot_with_commitment(CommitmentConfig::confirmed())
+        .context("Failed to get current slot")?;
+
+    println!("\nRPC Usage");
+    println!("Network:       {}", network);
+    println!("Programs:      {}", program_ids.len());
+    println!("Sig limit:     {} (RPC max 1000, clamped)", USAGE_SIG_LIMIT);
+    println!("Current slot:  {}", current_slot);
+    println!("Output:        {}", file_path);
+    println!();
+
+    // Write file header.
+    {
+        let mut f = File::create(&file_path)
+            .with_context(|| format!("Failed to create {}", file_path))?;
+        writeln!(f, "# RPC Usage Report")?;
+        writeln!(f, "# Network:      {}", network)?;
+        writeln!(f, "# Current slot: {}", current_slot)?;
+        writeln!(f, "# Sig limit:    {}", USAGE_SIG_LIMIT)?;
+        writeln!(f, "# Programs:     {}", program_ids.len())?;
+        writeln!(f, "#")?;
+        writeln!(
+            f,
+            "# {:<44}  {:>5}  {:>12}  {:>12}  {:>12}  {:>8}  {}",
+            "Program", "Sigs", "Newest Slot", "Oldest Slot", "Span", "Age", "Distribution"
+        )?;
+    }
+
+    let chunks: Vec<&[Pubkey]> = program_ids.chunks(USAGE_CHUNK_SIZE).collect();
+    let num_chunks = chunks.len();
+    let mut total_programs = 0usize;
+    let mut total_sigs = 0usize;
+    let mut total_errors = 0usize;
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        if chunk_idx > 0 {
+            println!(
+                "  ... sleeping {}s before next chunk ({}/{}) ...",
+                USAGE_CHUNK_SLEEP_SECS,
+                chunk_idx + 1,
+                num_chunks,
+            );
+            std::thread::sleep(std::time::Duration::from_secs(USAGE_CHUNK_SLEEP_SECS));
+        }
+
+        for pubkey in *chunk {
+            total_programs += 1;
+
+            let result = fetch_usage_for_program(&rpc_client, pubkey);
+
+            // Append to file immediately so partial runs are recoverable.
+            let mut f = OpenOptions::new()
+                .append(true)
+                .open(&file_path)
+                .with_context(|| format!("Failed to open {} for append", file_path))?;
+
+            match result {
+                Ok(usage) => {
+                    total_sigs += usage.sig_count;
+
+                    let capped = if usage.sig_count >= USAGE_SIG_LIMIT {
+                        "+"
+                    } else {
+                        ""
+                    };
+
+                    if usage.sig_count == 0 {
+                        println!(
+                            "  {}  sigs: 0/{}",
+                            pubkey, USAGE_SIG_LIMIT,
+                        );
+                        writeln!(
+                            f,
+                            "  {:<44}  {:>5}  {:>12}  {:>12}  {:>12}  {:>8}",
+                            pubkey, 0, "-", "-", "-", "-",
+                        )?;
+                    } else {
+                        let newest = usage.newest_slot.unwrap();
+                        let oldest = usage.oldest_slot.unwrap();
+                        let span = newest.saturating_sub(oldest);
+                        let age = current_slot.saturating_sub(newest);
+                        let age_str = format_slot_age(age);
+                        let sparkline = slot_sparkline(&usage.sig_slots, current_slot, 10);
+
+                        println!(
+                            "  {}  sigs: {}{}/{}  newest: {}  oldest: {}  span: {}  age: {} ({} slots)  [{}]",
+                            pubkey,
+                            usage.sig_count,
+                            capped,
+                            USAGE_SIG_LIMIT,
+                            newest,
+                            oldest,
+                            span,
+                            age_str,
+                            age,
+                            sparkline,
+                        );
+                        writeln!(
+                            f,
+                            "  {:<44}  {:>4}{}  {:>12}  {:>12}  {:>12}  {:>8}  [{}]",
+                            pubkey,
+                            usage.sig_count,
+                            capped,
+                            newest,
+                            oldest,
+                            span,
+                            age_str,
+                            sparkline,
+                        )?;
+                    }
+                }
+                Err(e) => {
+                    total_errors += 1;
+                    let err_msg = format!("{}", e);
+                    println!("  {}  ERROR: {}", pubkey, err_msg);
+                    writeln!(f, "  {:<44}  ERROR: {}", pubkey, err_msg)?;
+                }
+            }
+        }
+    }
+
+    println!();
+    println!("Total programs:    {}", total_programs);
+    println!("Total signatures:  {}", total_sigs);
+    if total_errors > 0 {
+        println!("Errors:            {}", total_errors);
+    }
+    println!("Output:            {}", file_path);
 
     Ok(())
 }
