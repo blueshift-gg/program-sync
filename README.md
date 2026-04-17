@@ -71,6 +71,7 @@ program-sync rpc <SUBCOMMAND> [OPTIONS]
 - `program-ids` - Fetch active program IDs and write them to a
   file
 - `usage` - Fetch transaction usage for a list of program IDs
+- `profile` - Profile SBPF version and finalization status per loader
 
 #### `rpc program-ids` - Fetch Program IDs
 
@@ -131,6 +132,42 @@ program-sync rpc usage --id TokenkegQ... --id Vote111...
 
 # Check usage for all programs from a program-ids output file
 program-sync rpc usage --file rpc-out/1234-program-ids-mainnet-upgradeable.txt
+```
+
+#### `rpc profile` - Profile SBPF Version and Finalization
+
+For each loader, report per-program SBPF version (v0/v1/v2/v3) and
+finalization status. Uses `getProgramAccounts` with a small
+`dataSlice` so no full ELFs are downloaded — only enough bytes to
+read the ELF header (`e_flags`) and, for v3/v4, the loader's state
+prefix.
+
+```bash
+program-sync rpc profile [OPTIONS]
+```
+
+**Options:**
+- `--loader <VERSION>` - Loader version (1-4), repeatable
+  (default: all loaders)
+- `--rpc-url <URL>` - Custom RPC endpoint
+- `--help, -h` - Show help
+
+**Status values:**
+- `immutable` — v1/v2 programs (no authority concept)
+- `upgradeable` — v3 with an upgrade authority, or v4 `Deployed`
+- `finalized` — v3 with no authority, or v4 `Finalized`
+- `retracted` — v4 `Retracted` (not executable)
+
+**Output:** `rpc-out/<timestamp>-profile-<network>.txt`
+
+**Examples:**
+
+```bash
+# Profile all loaders
+program-sync rpc profile
+
+# Profile BPFLoaderUpgradeable only
+program-sync rpc profile --loader 3
 ```
 
 ### `sync` - Download Programs
