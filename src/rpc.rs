@@ -412,6 +412,444 @@ const USAGE_SIG_LIMIT: usize = 300;
 const USAGE_CHUNK_SIZE: usize = 10;
 const USAGE_CHUNK_SLEEP_SECS: u64 = 5;
 
+/// LoaderV4State size: slot(8) + authority(32) + status(8).
+const LOADERV4_STATE_SIZE: usize = 48;
+
+/// Parse the SBPF version out of an ELF header. The version is stored in
+/// `e_flags` (u32 LE at byte offset 48 of the ELF header). Returns `None`
+/// if the buffer is too short or lacks the ELF magic.
+fn sbpf_version_from_elf_header(elf_bytes: &[u8]) -> Option<u32> {
+    if elf_bytes.len() < 52 || !elf_bytes.starts_with(ELF_MAGIC) {
+        return None;
+    }
+    Some(u32::from_le_bytes(elf_bytes[48..52].try_into().ok()?))
+}
+
+/// Parse just the upgrade authority and SBPF version from a ProgramData
+/// account slice. Unlike `parse_programdata`, this does not require the full
+/// ELF — only enough bytes to cover the authority (45) and ELF header (52).
+fn parse_programdata_header(data: &[u8]) -> Result<(Option<Pubkey>, Option<u32>)> {
+    if data.len() < 45 {
+        anyhow::bail!("ProgramData slice too small");
+    }
+    let discriminator = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if discriminator != PROGRAMDATA_DISCRIMINATOR {
+        anyhow::bail!("Invalid ProgramData discriminator: {}", discriminator);
+    }
+    let option_tag = data[12];
+    let pubkey_bytes: [u8; 32] = data[13..45].try_into()?;
+    let upgrade_authority = match option_tag {
+        0 => None,
+        1 => Some(Pubkey::new_from_array(pubkey_bytes)),
+        _ => anyhow::bail!("Invalid Option tag: {}", option_tag),
+    };
+    let sbpf_version = if data.len() >= 45 + 52 {
+        sbpf_version_from_elf_header(&data[45..])
+    } else {
+        None
+    };
+    Ok((upgrade_authority, sbpf_version))
+}
+
+/// Parse the LoaderV4 status and SBPF version from a program account slice.
+/// Status is a `u64` LE at offset 40 (slot 8 + authority 32); the ELF starts
+/// at offset 48.
+fn parse_loaderv4_header(data: &[u8]) -> Result<(u64, Option<u32>)> {
+    if data.len() < LOADERV4_STATE_SIZE {
+        anyhow::bail!("LoaderV4 account too small");
+    }
+    let status = u64::from_le_bytes(data[40..48].try_into()?);
+    let sbpf_version = if data.len() >= LOADERV4_STATE_SIZE + 52 {
+        sbpf_version_from_elf_header(&data[LOADERV4_STATE_SIZE..])
+    } else {
+        None
+    };
+    Ok((status, sbpf_version))
+}
+
+/// Finalization classification for a program entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizationStatus {
+    /// v1/v2: no authority concept — always immutable.
+    Immutable,
+    /// v3 with an upgrade authority, or v4 `Deployed` (editable).
+    Upgradeable,
+    /// v3 with `None` authority, or v4 `Finalized`.
+    Finalized,
+    /// v4 `Retracted` (not executable, still editable).
+    Retracted,
+    /// Unparseable or unrecognized status.
+    Unknown,
+}
+
+fn finalization_label(status: FinalizationStatus) -> &'static str {
+    match status {
+        FinalizationStatus::Immutable => "immutable",
+        FinalizationStatus::Upgradeable => "upgradeable",
+        FinalizationStatus::Finalized => "finalized",
+        FinalizationStatus::Retracted => "retracted",
+        FinalizationStatus::Unknown => "unknown",
+    }
+}
+
+/// A single program's profile entry.
+pub struct ProfileEntry {
+    pub pubkey: Pubkey,
+    pub loader_version: i32,
+    /// Raw `e_flags` value from the ELF header, or `None` if unreadable.
+    pub sbpf_version: Option<u32>,
+    pub finalization: FinalizationStatus,
+}
+
+fn sbpf_label(version: Option<u32>) -> String {
+    match version {
+        Some(v @ 0..=3) => format!("v{}", v),
+        Some(v) => format!("?({})", v),
+        None => "-".to_string(),
+    }
+}
+
+/// Bucket index for a summary row: 0=v0, 1=v1, 2=v2, 3=v3, 4=unknown.
+fn sbpf_bucket(version: Option<u32>) -> usize {
+    match version {
+        Some(0) => 0,
+        Some(1) => 1,
+        Some(2) => 2,
+        Some(3) => 3,
+        _ => 4,
+    }
+}
+
+fn format_sbpf_row(counts: &[usize; 5]) -> String {
+    format!(
+        "v0: {}  v1: {}  v2: {}  v3: {}  unknown: {}",
+        counts[0], counts[1], counts[2], counts[3], counts[4]
+    )
+}
+
+/// Fetch v1/v2 program accounts with enough ELF header bytes to read SBPF version.
+fn fetch_profile_v1_v2(
+    rpc_client: &RpcClient,
+    loader_version: i32,
+) -> Result<Vec<ProfileEntry>> {
+    let loader_str = version_to_loader(loader_version)
+        .ok_or_else(|| anyhow::anyhow!("Invalid loader version: {}", loader_version))?;
+    let loader_pubkey = Pubkey::from_str(loader_str)?;
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message(format!(
+        ">>> PROFILING LOADER V{} PROGRAMS",
+        loader_version
+    ));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let config = RpcProgramAccountsConfig {
+        filters: None,
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            data_slice: Some(solana_account_decoder::UiDataSliceConfig {
+                offset: 0,
+                length: 128,
+            }),
+            min_context_slot: None,
+        },
+        with_context: None,
+        sort_results: None,
+    };
+
+    let accounts = rpc_client.get_program_accounts_with_config(&loader_pubkey, config)?;
+
+    let entries: Vec<ProfileEntry> = accounts
+        .into_iter()
+        .filter(|(_, acc)| acc.executable)
+        .map(|(pubkey, acc)| ProfileEntry {
+            pubkey,
+            loader_version,
+            sbpf_version: sbpf_version_from_elf_header(&acc.data),
+            finalization: FinalizationStatus::Immutable,
+        })
+        .collect();
+
+    spinner.finish_with_message(format!(
+        ">>> PROFILED {} ACTIVE LOADER V{} PROGRAMS",
+        entries.len(),
+        loader_version
+    ));
+    Ok(entries)
+}
+
+/// Fetch v3 programs: Program accounts provide IDs, ProgramData accounts
+/// provide the authority + ELF header. Joined via `derive_programdata_address`.
+fn fetch_profile_v3(rpc_client: &RpcClient) -> Result<Vec<ProfileEntry>> {
+    let loader_pubkey = Pubkey::from_str(BPF_LOADER_UPGRADEABLE)?;
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message(">>> FETCHING BPFLoaderUpgradeable PROGRAM ACCOUNTS");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    // 1. Program accounts (discriminator 2): just need pubkeys.
+    let program_config = RpcProgramAccountsConfig {
+        filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            0,
+            vec![2, 0, 0, 0],
+        ))]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            data_slice: Some(solana_account_decoder::UiDataSliceConfig {
+                offset: 0,
+                length: 4,
+            }),
+            min_context_slot: None,
+        },
+        with_context: None,
+        sort_results: None,
+    };
+    let program_accounts =
+        rpc_client.get_program_accounts_with_config(&loader_pubkey, program_config)?;
+    let program_pubkeys: Vec<Pubkey> = program_accounts
+        .into_iter()
+        .filter_map(|(pk, acc)| if acc.executable { Some(pk) } else { None })
+        .collect();
+
+    spinner.set_message(format!(
+        ">>> FETCHING PROGRAMDATA ({} programs)",
+        program_pubkeys.len()
+    ));
+
+    // 2. ProgramData accounts (discriminator 3): pull enough to cover authority + ELF header.
+    let pd_config = RpcProgramAccountsConfig {
+        filters: Some(vec![RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
+            0,
+            vec![3, 0, 0, 0],
+        ))]),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            data_slice: Some(solana_account_decoder::UiDataSliceConfig {
+                offset: 0,
+                length: 128,
+            }),
+            min_context_slot: None,
+        },
+        with_context: None,
+        sort_results: None,
+    };
+    let pd_accounts = rpc_client.get_program_accounts_with_config(&loader_pubkey, pd_config)?;
+
+    let mut pd_map: HashMap<Pubkey, (Option<Pubkey>, Option<u32>)> =
+        HashMap::with_capacity(pd_accounts.len());
+    for (pd_pubkey, acc) in pd_accounts {
+        if let Ok(parsed) = parse_programdata_header(&acc.data) {
+            pd_map.insert(pd_pubkey, parsed);
+        }
+    }
+
+    // 3. Join Program → ProgramData.
+    let mut entries = Vec::with_capacity(program_pubkeys.len());
+    for pk in program_pubkeys {
+        let pd_addr = derive_programdata_address(&pk)?;
+        if let Some((authority, sbpf)) = pd_map.get(&pd_addr) {
+            let finalization = if authority.is_none() {
+                FinalizationStatus::Finalized
+            } else {
+                FinalizationStatus::Upgradeable
+            };
+            entries.push(ProfileEntry {
+                pubkey: pk,
+                loader_version: 3,
+                sbpf_version: *sbpf,
+                finalization,
+            });
+        }
+    }
+
+    spinner.finish_with_message(format!(
+        ">>> PROFILED {} ACTIVE BPFLoaderUpgradeable PROGRAMS",
+        entries.len()
+    ));
+    Ok(entries)
+}
+
+/// Fetch v4 program accounts: state (48 bytes) + ELF header in a single slice.
+fn fetch_profile_v4(rpc_client: &RpcClient) -> Result<Vec<ProfileEntry>> {
+    let loader_pubkey = Pubkey::from_str(LOADER_V4)?;
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message(">>> PROFILING LoaderV4 PROGRAMS");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    let config = RpcProgramAccountsConfig {
+        filters: None,
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            data_slice: Some(solana_account_decoder::UiDataSliceConfig {
+                offset: 0,
+                length: 128,
+            }),
+            min_context_slot: None,
+        },
+        with_context: None,
+        sort_results: None,
+    };
+    let accounts = rpc_client.get_program_accounts_with_config(&loader_pubkey, config)?;
+
+    let entries: Vec<ProfileEntry> = accounts
+        .into_iter()
+        .filter_map(|(pk, acc)| {
+            let (status, sbpf) = parse_loaderv4_header(&acc.data).ok()?;
+            let finalization = match status {
+                0 => FinalizationStatus::Retracted,
+                1 => FinalizationStatus::Upgradeable,
+                2 => FinalizationStatus::Finalized,
+                _ => FinalizationStatus::Unknown,
+            };
+            Some(ProfileEntry {
+                pubkey: pk,
+                loader_version: 4,
+                sbpf_version: sbpf,
+                finalization,
+            })
+        })
+        .collect();
+
+    spinner.finish_with_message(format!(
+        ">>> PROFILED {} ACTIVE LoaderV4 PROGRAMS",
+        entries.len()
+    ));
+    Ok(entries)
+}
+
+/// Fetch profile entries for a given loader.
+pub fn fetch_profile_for_loader(
+    rpc_client: &RpcClient,
+    loader_version: i32,
+) -> Result<Vec<ProfileEntry>> {
+    match loader_version {
+        1 | 2 => fetch_profile_v1_v2(rpc_client, loader_version),
+        3 => fetch_profile_v3(rpc_client),
+        4 => fetch_profile_v4(rpc_client),
+        _ => anyhow::bail!("Invalid loader version: {}", loader_version),
+    }
+}
+
+/// RPC profile command: for each loader, report a per-program SBPF version
+/// and finalization classification. Writes a per-program CSV-ish table to
+/// `rpc-out/<ts>-profile-<network>.txt` and a summary to stdout.
+pub fn profile_command(loader_versions: Vec<i32>, rpc_url: String) -> Result<()> {
+    let network = rpc_network_name(&rpc_url);
+    let rpc_client = RpcClient::new(&rpc_url);
+
+    let output_dir = "rpc-out";
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("Failed to get system time")?
+        .as_secs();
+
+    fs::create_dir_all(output_dir).context("Failed to create output directory")?;
+    let file_path = format!("{}/{}-profile-{}.txt", output_dir, timestamp, network);
+
+    println!("\nRPC Profile");
+    println!("Network:  {}", network);
+    println!("Output:   {}", file_path);
+    println!();
+
+    let mut out_file =
+        File::create(&file_path).with_context(|| format!("Failed to create {}", file_path))?;
+    writeln!(out_file, "# RPC Profile Report")?;
+    writeln!(out_file, "# Network:   {}", network)?;
+    writeln!(out_file, "# Timestamp: {}", timestamp)?;
+    writeln!(out_file, "#")?;
+    writeln!(
+        out_file,
+        "# {:<44}  {:<6}  {:<6}  Status",
+        "Program", "Loader", "SBPF"
+    )?;
+
+    let mut grand_total = 0usize;
+
+    for loader_version in &loader_versions {
+        let name = loader_version_name(*loader_version);
+        let entries = fetch_profile_for_loader(&rpc_client, *loader_version)?;
+        let count = entries.len();
+        if count == 0 {
+            println!("{}:  0 programs (skipped)", name);
+            println!();
+            continue;
+        }
+        grand_total += count;
+
+        // Summary counts, bucketed by SBPF version (v0, v1, v2, v3, unknown).
+        let mut total = [0usize; 5];
+        let mut immutable = [0usize; 5];
+        let mut upgradeable = [0usize; 5];
+        let mut finalized = [0usize; 5];
+        let mut retracted = [0usize; 5];
+        for e in &entries {
+            let b = sbpf_bucket(e.sbpf_version);
+            total[b] += 1;
+            match e.finalization {
+                FinalizationStatus::Immutable => immutable[b] += 1,
+                FinalizationStatus::Upgradeable => upgradeable[b] += 1,
+                FinalizationStatus::Finalized => finalized[b] += 1,
+                FinalizationStatus::Retracted => retracted[b] += 1,
+                FinalizationStatus::Unknown => {}
+            }
+        }
+
+        println!("{}  ({} programs)", name, count);
+        println!("  SBPF:      {}", format_sbpf_row(&total));
+        match loader_version {
+            1 | 2 => println!("  Finalized: {}", format_sbpf_row(&immutable)),
+            3 => println!("  Finalized: {}", format_sbpf_row(&finalized)),
+            4 => {
+                println!("  Finalized: {}", format_sbpf_row(&finalized));
+                println!("  Deployed:  {}", format_sbpf_row(&upgradeable));
+                println!("  Retracted: {}", format_sbpf_row(&retracted));
+            }
+            _ => {}
+        }
+        println!();
+
+        // Per-program rows.
+        for e in &entries {
+            writeln!(
+                out_file,
+                "  {:<44}  v{:<5}  {:<6}  {}",
+                e.pubkey,
+                e.loader_version,
+                sbpf_label(e.sbpf_version),
+                finalization_label(e.finalization),
+            )?;
+        }
+    }
+
+    println!("Total:  {} programs", grand_total);
+    println!("Output: {}", file_path);
+
+    Ok(())
+}
+
 /// Build a slot distribution sparkline for a set of signature slots.
 ///
 /// Divides the range [oldest_slot, current_slot] into `num_buckets` equal-width
