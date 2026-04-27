@@ -26,7 +26,8 @@ use std::sync::{Arc, Mutex};
 
 use rpc::{
     ProgramAccount, derive_programdata_address, fetch_all_programdata_accounts,
-    fetch_programs_for_loader, loader_version_name, parse_programdata,
+    fetch_programs_for_loader, loader_version_name, parse_loaderv4_program,
+    parse_programdata,
 };
 
 /// Dummy context object for static analysis (no execution needed)
@@ -273,7 +274,7 @@ fn download_programs(
                 |(program_id, exec_pubkey_opt, stored_slot, loader_version)| {
                     // Determine which account to fetch from
                     // v3 (BPFUpgradeable): fetch from derived executable account
-                    // v1, v2: fetch from program account directly
+                    // v1, v2, v4: fetch from program account directly
                     let account_to_fetch = if *loader_version == 3 {
                         // BPFUpgradeable - use derived executable account
                         match exec_pubkey_opt {
@@ -286,7 +287,7 @@ fn download_programs(
                             }
                         }
                     } else {
-                        // v0, v1, v2 - use program account directly
+                        // v1, v2, v4 - use program account directly
                         program_id.clone()
                     };
 
@@ -337,10 +338,21 @@ fn download_programs(
                                 };
                             }
                         }
+                    } else if *loader_version == 4 {
+                        // LoaderV4 - strip 48-byte LoaderV4State prefix to get the ELF
+                        // (see solana_loader_v4_interface::state::LoaderV4State)
+                        match parse_loaderv4_program(&account_data) {
+                            Ok(data) => data,
+                            Err(_) => {
+                                return DownloadResult {
+                                    program_id: program_id.clone(),
+                                    status: DownloadStatus::Error,
+                                };
+                            }
+                        }
                     } else {
                         // v1, v2 - raw program data (no slot tracking, no upgrade authority)
                         // Use 1 as a dummy slot since these loaders don't have slot tracking
-                        // v0 is already filtered out above
                         (1, None, account_data)
                     };
 
