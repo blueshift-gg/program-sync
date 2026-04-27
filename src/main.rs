@@ -1277,6 +1277,7 @@ fn print_rpc_help() {
     println!("\nSUBCOMMANDS:");
     println!("  program-ids   Fetch active program IDs and write them to a file");
     println!("  usage         Fetch transaction usage for a list of program IDs");
+    println!("  profile       Profile SBPF version and finalization status per loader");
     println!("\nFor subcommand-specific options, use:");
     println!("  program-sync rpc <SUBCOMMAND> --help");
     println!();
@@ -1341,6 +1342,37 @@ fn print_rpc_usage_help() {
     println!();
     println!("  # Check usage for all programs from a program-ids output file");
     println!("  program-sync rpc usage --file rpc-out/1234-program-ids-mainnet-upgradeable.txt");
+    println!();
+}
+
+fn print_rpc_profile_help() {
+    println!("RPC PROFILE");
+    println!("\nUSAGE:");
+    println!("  program-sync rpc profile [OPTIONS]");
+    println!("\nDESCRIPTION:");
+    println!("  For each loader, report per-program SBPF version (v0/v1/v2/v3) and");
+    println!("  finalization status. Uses getProgramAccounts with a small dataSlice");
+    println!("  so no full ELFs are downloaded. Writes a per-program table to");
+    println!("  rpc-out/ and a summary to stdout.");
+    println!("\nOPTIONS:");
+    println!("  --loader <VERSION>    Loader version (1-4), can be specified multiple times");
+    println!("                        Default: all loaders (1-4) if not specified");
+    println!("  --rpc-url <URL>       RPC endpoint URL");
+    println!("                        Default: RPC_ENDPOINT env var or mainnet");
+    println!("  --help, -h            Show this help message");
+    println!("\nSTATUS VALUES:");
+    println!("  immutable    v1/v2 programs — no authority concept");
+    println!("  upgradeable  v3 with upgrade authority, or v4 Deployed");
+    println!("  finalized    v3 with no authority, or v4 Finalized");
+    println!("  retracted    v4 Retracted (not executable)");
+    println!("\nOUTPUT:");
+    println!("  File: rpc-out/<timestamp>-profile-<network>.txt");
+    println!("\nEXAMPLES:");
+    println!("  # Profile all loaders");
+    println!("  program-sync rpc profile");
+    println!();
+    println!("  # Profile BPFLoaderUpgradeable only");
+    println!("  program-sync rpc profile --loader 3");
     println!();
 }
 
@@ -1578,6 +1610,54 @@ fn main() -> Result<()> {
                     }
 
                     rpc::usage_command(ids, file, rpc_url)
+                }
+                "profile" => {
+                    let mut loader_versions = Vec::new();
+                    let mut rpc_url = std::env::var("RPC_ENDPOINT")
+                        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_owned());
+
+                    let mut i = 3;
+                    while i < args.len() {
+                        match args[i].as_str() {
+                            "--loader" => {
+                                if i + 1 < args.len() {
+                                    let version: i32 =
+                                        args[i + 1].parse().context("Invalid loader version")?;
+                                    if !(1..=4).contains(&version) {
+                                        anyhow::bail!("Loader version must be between 1 and 4");
+                                    }
+                                    loader_versions.push(version);
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--loader requires a version argument");
+                                }
+                            }
+                            "--rpc-url" => {
+                                if i + 1 < args.len() {
+                                    rpc_url = args[i + 1].clone();
+                                    i += 2;
+                                } else {
+                                    anyhow::bail!("--rpc-url requires a URL argument");
+                                }
+                            }
+                            "--help" | "-h" => {
+                                print_rpc_profile_help();
+                                return Ok(());
+                            }
+                            _ => {
+                                anyhow::bail!(
+                                    "Unknown argument: {}. Use 'rpc profile --help' for usage.",
+                                    args[i]
+                                );
+                            }
+                        }
+                    }
+
+                    if loader_versions.is_empty() {
+                        loader_versions = vec![1, 2, 3, 4];
+                    }
+
+                    rpc::profile_command(loader_versions, rpc_url)
                 }
                 _ => {
                     anyhow::bail!(
