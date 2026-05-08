@@ -215,6 +215,7 @@ program-sync analyze --opcode <OPCODE> [OPTIONS]
 - `--opcode <OPCODE>` - sBPF opcode to analyze, or `all` for all opcodes (required)
 - `--agg <FIELD>` - Aggregate and show distribution by field (`src`, `dst`, `imm`, `off`)
 - `--count [FILTERS]` - Count matching instructions (optionally with filters)
+- `--contains [FILTERS]` - Count programs that contain at least one matching instruction (vs programs that don't). Same filter format as `--count`. Requires a specific `--opcode` (not `all`).
 - `--dir <PATH>` - Program directory (default: `programs`)
 - `--help, -h` - Show help
 
@@ -235,6 +236,12 @@ program-sync analyze --opcode all --count src=2
 
 # Distribution of src registers across ALL opcodes
 program-sync analyze --opcode all --agg src
+
+# Count programs that contain at least one callx instruction
+program-sync analyze --opcode callx --contains
+
+# Count programs containing add64 with src=1
+program-sync analyze --opcode add64 --contains src=1
 ```
 
 ### `dfg` - Data-Flow Graph Analysis

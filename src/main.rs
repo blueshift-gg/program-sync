@@ -559,6 +559,7 @@ fn sync_command(
 enum AnalyzeMode {
     Aggregate { field: String },
     Count { filters: HashMap<String, i64> },
+    Contains { filters: HashMap<String, i64> },
 }
 
 fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -> Result<()> {
@@ -1009,6 +1010,144 @@ fn analyze_command(opcode_str: String, mode: AnalyzeMode, program_dir: String) -
 
             println!("{}", "=".repeat(60));
         }
+
+        AnalyzeMode::Contains { filters } => {
+            let target_opcode = target_opcode.ok_or_else(|| {
+                anyhow::anyhow!("--contains requires a specific --opcode (not 'all')")
+            })?;
+
+            let with_match = AtomicUsize::new(0);
+            let without_match = AtomicUsize::new(0);
+            let files_processed = AtomicUsize::new(0);
+            let files_with_errors = AtomicUsize::new(0);
+            let error_log = Mutex::new(Vec::<(String, String)>::new());
+
+            so_files.par_iter().for_each(|entry| {
+                let path = entry.path();
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                let elf_data = match fs::read(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        files_with_errors.fetch_add(1, Ordering::Relaxed);
+                        error_log
+                            .lock()
+                            .unwrap()
+                            .push((filename, format!("Read error: {}", e)));
+                        pb.inc(1);
+                        return;
+                    }
+                };
+
+                let program = match Program::from_bytes(&elf_data) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        files_with_errors.fetch_add(1, Ordering::Relaxed);
+                        error_log
+                            .lock()
+                            .unwrap()
+                            .push((filename, format!("Parse error: {}", e)));
+                        pb.inc(1);
+                        return;
+                    }
+                };
+
+                let instructions = match program.to_ixs() {
+                    Ok(i) => i,
+                    Err(e) => {
+                        files_with_errors.fetch_add(1, Ordering::Relaxed);
+                        error_log
+                            .lock()
+                            .unwrap()
+                            .push((filename, format!("Disassembly error: {}", e)));
+                        pb.inc(1);
+                        return;
+                    }
+                };
+
+                let found = instructions.0.iter().any(|instruction| {
+                    if instruction.opcode != target_opcode {
+                        return false;
+                    }
+                    for (field, expected_value) in &filters {
+                        let actual_value = match field.as_str() {
+                            "src" => instruction.src.as_ref().map(|r| r.n as i64),
+                            "dst" => instruction.dst.as_ref().map(|r| r.n as i64),
+                            "imm" => instruction.imm.as_ref().and_then(|imm| match imm {
+                                Either::Right(num) => Some(num.to_i64()),
+                                Either::Left(_) => None,
+                            }),
+                            "off" => instruction.off.as_ref().and_then(|off| match off {
+                                Either::Right(offset) => Some(*offset as i64),
+                                Either::Left(_) => None,
+                            }),
+                            _ => None,
+                        };
+                        if actual_value != Some(*expected_value) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+
+                if found {
+                    with_match.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    without_match.fetch_add(1, Ordering::Relaxed);
+                }
+                files_processed.fetch_add(1, Ordering::Relaxed);
+                pb.inc(1);
+            });
+
+            pb.finish_and_clear();
+
+            let with_match = with_match.load(Ordering::Relaxed);
+            let without_match = without_match.load(Ordering::Relaxed);
+            let files_processed = files_processed.load(Ordering::Relaxed);
+            let files_with_errors = files_with_errors.load(Ordering::Relaxed);
+            let error_log = error_log.into_inner().unwrap();
+
+            println!("\n{}", "=".repeat(60));
+            println!("ANALYSIS RESULTS");
+            println!("{}", "=".repeat(60));
+            println!("Files processed:       {}", files_processed);
+            println!("Files with errors:     {}", files_with_errors);
+
+            if !error_log.is_empty() {
+                println!();
+                println!("Errors encountered:");
+                println!("{}", "-".repeat(60));
+                for (filename, error) in &error_log {
+                    println!("  {}: {}", filename, error);
+                }
+            }
+
+            println!();
+            print!("Programs containing {}", target_opcode);
+            for (field, value) in &filters {
+                print!(" {}={}", field, value);
+            }
+            println!(":");
+            println!("{}", "-".repeat(60));
+            let total = with_match + without_match;
+            let with_pct = if total > 0 {
+                (with_match as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            let without_pct = if total > 0 {
+                (without_match as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            println!("With match:    {:<10} ({:.2}%)", with_match, with_pct);
+            println!("Without match: {:<10} ({:.2}%)", without_match, without_pct);
+            println!("{}", "=".repeat(60));
+        }
     }
 
     Ok(())
@@ -1423,10 +1562,13 @@ fn print_analyze_help() {
     println!("  --agg <FIELD>         Aggregate by field: src, dst, imm, or off");
     println!("  --count [FILTERS]     Count instructions (optionally with filters)");
     println!("                        Filters format: field=value,field2=value2");
+    println!("  --contains [FILTERS]  Count programs that contain at least one matching");
+    println!("                        instruction (vs programs that don't). Same filter format");
+    println!("                        as --count. Requires a specific --opcode (not 'all').");
     println!("  --dir <PATH>          Program directory (default: programs)");
     println!("  --help, -h            Show this help message");
     println!("\nNOTE:");
-    println!("  Either --agg or --count must be specified (not both)");
+    println!("  Specify exactly one of --agg, --count, or --contains");
     println!("\nEXAMPLES:");
     println!("  # Count all call instructions");
     println!("  program-sync analyze --opcode call --count");
@@ -1448,6 +1590,12 @@ fn print_analyze_help() {
     println!();
     println!("  # Distribution of src registers across ALL opcodes");
     println!("  program-sync analyze --opcode all --agg src");
+    println!();
+    println!("  # Count programs that contain at least one callx instruction");
+    println!("  program-sync analyze --opcode callx --contains");
+    println!();
+    println!("  # Count programs containing add64 with src=1");
+    println!("  program-sync analyze --opcode add64 --contains src=1");
     println!();
 }
 
@@ -1731,6 +1879,7 @@ fn main() -> Result<()> {
             let mut opcode: Option<String> = None;
             let mut agg_field: Option<String> = None;
             let mut count_filters: Option<String> = None;
+            let mut contains_filters: Option<String> = None;
             let mut program_dir = "programs".to_string();
 
             let mut i = 2;
@@ -1761,6 +1910,15 @@ fn main() -> Result<()> {
                             i += 1;
                         }
                     }
+                    "--contains" => {
+                        if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                            contains_filters = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            contains_filters = Some(String::new());
+                            i += 1;
+                        }
+                    }
                     "--dir" => {
                         if i + 1 < args.len() {
                             program_dir = args[i + 1].clone();
@@ -1786,13 +1944,15 @@ fn main() -> Result<()> {
             let opcode = opcode
                 .ok_or_else(|| anyhow::anyhow!("--opcode is required for analyze command"))?;
 
-            // Determine mode
-            let mode = if let Some(field) = agg_field {
-                if count_filters.is_some() {
-                    anyhow::bail!("Cannot use both --agg and --count");
-                }
-                AnalyzeMode::Aggregate { field }
-            } else if let Some(filter_str) = count_filters {
+            // Determine mode (exactly one of --agg, --count, --contains)
+            let mode_count = [agg_field.is_some(), count_filters.is_some(), contains_filters.is_some()]
+                .iter()
+                .filter(|x| **x)
+                .count();
+            if mode_count > 1 {
+                anyhow::bail!("Specify only one of --agg, --count, or --contains");
+            }
+            let parse_filters = |filter_str: String| -> Result<HashMap<String, i64>> {
                 let mut filters = HashMap::new();
                 if !filter_str.is_empty() {
                     for pair in filter_str.split(',') {
@@ -1807,9 +1967,16 @@ fn main() -> Result<()> {
                         filters.insert(field, value);
                     }
                 }
-                AnalyzeMode::Count { filters }
+                Ok(filters)
+            };
+            let mode = if let Some(field) = agg_field {
+                AnalyzeMode::Aggregate { field }
+            } else if let Some(filter_str) = count_filters {
+                AnalyzeMode::Count { filters: parse_filters(filter_str)? }
+            } else if let Some(filter_str) = contains_filters {
+                AnalyzeMode::Contains { filters: parse_filters(filter_str)? }
             } else {
-                anyhow::bail!("Must specify either --agg or --count");
+                anyhow::bail!("Must specify one of --agg, --count, or --contains");
             };
 
             analyze_command(opcode, mode, program_dir)
