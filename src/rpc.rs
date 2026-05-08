@@ -467,6 +467,39 @@ fn parse_loaderv4_header(data: &[u8]) -> Result<(u64, Option<u32>)> {
     Ok((status, sbpf_version))
 }
 
+/// Parse a complete LoaderV4 program account: 48-byte state header + ELF.
+/// Layout: slot `u64` (0..8) + authority `Pubkey` (8..40) + status `u64`
+/// (40..48); ELF begins at offset 48. Authority is returned as `None` for
+/// `Finalized` (status=2) since the field then carries a next-version address.
+/// Source: `solana_loader_v4_interface::state::LoaderV4State`.
+pub fn parse_loaderv4_program(data: &[u8]) -> Result<(u64, Option<Pubkey>, Vec<u8>)> {
+    if data.len() < LOADERV4_STATE_SIZE {
+        anyhow::bail!("LoaderV4 account too small");
+    }
+    let slot = u64::from_le_bytes(data[0..8].try_into()?);
+    let authority_bytes: [u8; 32] = data[8..40].try_into()?;
+    let status = u64::from_le_bytes(data[40..48].try_into()?);
+
+    // Finalized: field is the next-version address, not an upgrade authority.
+    let authority = match status {
+        2 => None,
+        _ => Some(Pubkey::new_from_array(authority_bytes)),
+    };
+
+    if data.len() < LOADERV4_STATE_SIZE + 4 {
+        anyhow::bail!("No ELF data found after LoaderV4 state header");
+    }
+    if &data[LOADERV4_STATE_SIZE..LOADERV4_STATE_SIZE + 4] != ELF_MAGIC {
+        anyhow::bail!(
+            "Invalid ELF magic after LoaderV4 state header: {:02x?}",
+            &data[LOADERV4_STATE_SIZE..LOADERV4_STATE_SIZE + 4]
+        );
+    }
+
+    let elf_data = data[LOADERV4_STATE_SIZE..].to_vec();
+    Ok((slot, authority, elf_data))
+}
+
 /// Finalization classification for a program entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizationStatus {
