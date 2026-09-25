@@ -36,6 +36,11 @@ impl ContextObject for DummyContextObject {
     fn get_remaining(&self) -> u64 {
         0
     }
+    fn active_mapping_ptr(
+        &mut self,
+    ) -> std::ptr::NonNull<solana_sbpf::memory_region::MemoryMapping> {
+        unreachable!("static analysis does not execute programs")
+    }
 }
 
 /// Create or update database schema
