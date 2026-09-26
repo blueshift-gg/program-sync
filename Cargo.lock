@@ -2256,7 +2256,7 @@ dependencies = [
  "solana-client",
  "solana-commitment-config",
  "solana-program",
- "solana-sbpf",
+ "solana-sbpf 0.25.0",
  "tokio",
 ]
 
@@ -4094,6 +4094,19 @@ dependencies = [
  "byteorder",
  "combine 3.8.1",
  "hash32",
+ "log",
+ "rustc-demangle",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "solana-sbpf"
+version = "0.25.0"
+source = "git+https://github.com/febo/sbpf.git?branch=v2-dfg-fix#2abb02d6e576cfff9957740e7527825adbf0909d"
+dependencies = [
+ "byteorder",
+ "combine 3.8.1",
+ "hash32",
  "libc",
  "log",
  "rand 0.8.5",
@@ -4493,7 +4506,7 @@ dependencies = [
  "solana-instructions-sysvar",
  "solana-pubkey 3.0.0",
  "solana-rent",
- "solana-sbpf",
+ "solana-sbpf 0.13.1",
  "solana-sdk-ids",
 ]
 
